@@ -246,5 +246,6 @@ func providerError(operation string, err error) error {
 
 func dockerNotFound(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "no such container") ||
+		strings.Contains(strings.ToLower(err.Error()), "no such object") ||
 		strings.Contains(strings.ToLower(err.Error()), "not found")
 }
