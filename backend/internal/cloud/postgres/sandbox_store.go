@@ -55,7 +55,7 @@ func (s *Store) ClaimSandboxes(
 			COALESCE(sandbox.provider_environment_id, ''),
 			COALESCE(sandbox.provider_connection_id::text, ''),
 			sandbox.desired_state, sandbox.observed_state,
-			sandbox.resource_profile, sandbox.worker_last_seen_at,
+			sandbox.resource_profile, sandbox.auto_stop_minutes, sandbox.worker_last_seen_at,
 			sandbox.last_error, sandbox.reconcile_after,
 			sandbox.created_at, sandbox.updated_at
 	`, limit, owner, intervalString(lease))
@@ -192,7 +192,7 @@ func (s *Store) GetSandbox(
 		SELECT session_id, account_id, org_id, provider,
 			COALESCE(provider_environment_id, ''),
 			COALESCE(provider_connection_id::text, ''),
-			desired_state, observed_state, resource_profile, worker_last_seen_at,
+			desired_state, observed_state, resource_profile, auto_stop_minutes, worker_last_seen_at,
 			last_error, reconcile_after, created_at, updated_at
 		FROM ao_sandboxes
 		WHERE org_id = $1 AND session_id = $2
@@ -363,6 +363,7 @@ func scanSandbox(row rowScanner) (clouddomain.Sandbox, error) {
 		&sandbox.DesiredState,
 		&sandbox.ObservedState,
 		&resourceRaw,
+		&sandbox.AutoStopMinutes,
 		&sandbox.WorkerLastSeenAt,
 		&sandbox.LastError,
 		&sandbox.ReconcileAfter,

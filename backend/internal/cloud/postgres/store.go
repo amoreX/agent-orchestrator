@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -532,6 +533,9 @@ type CreateSessionInput struct {
 	Branch                   string
 	Prompt                   string
 	Resource                 clouddomain.ResourceProfile
+	Mode                     string
+	DeniedCommands           []string
+	AutoStopMinutes          int
 	Provider                 string
 	ProviderConnectionID     string
 	MaxActiveSandboxesPerOrg int `json:"-"`
@@ -599,18 +603,28 @@ func (s *Store) CreateSession(
 		input.Branch = "ao/" + slug(input.DisplayName) + "-" + commandID[:8]
 	}
 	sessionID := uuid.NewString()
+	// Per-session security policy. Normalize so a session always carries a known
+	// mode, and a non-nil (possibly empty) denied list satisfies the NOT NULL
+	// text[] column.
+	mode := clouddomain.NormalizeSandboxMode(input.Mode)
+	deniedCommands := input.DeniedCommands
+	if deniedCommands == nil {
+		deniedCommands = []string{}
+	}
 	var session clouddomain.Session
 	err = tx.QueryRow(ctx, `
 		INSERT INTO ao_sessions (
-			id, account_id, org_id, project_id, kind, harness, display_name, branch, prompt
+			id, account_id, org_id, project_id, kind, harness, display_name, branch, prompt,
+			mode, denied_commands
 		)
-		SELECT $1, $2, $2, id, $3, $4, $5, $6, $7
+		SELECT $1, $2, $2, id, $3, $4, $5, $6, $7, $9, $10
 		FROM ao_projects
 		WHERE id = $8 AND org_id = $2
 		RETURNING id, account_id, org_id, project_id, kind, harness, display_name, branch,
-			prompt, activity_state, is_terminated, agent_session_id, created_at,
+			prompt, mode, denied_commands, activity_state, is_terminated, agent_session_id, created_at,
 			updated_at
-	`, sessionID, accountID, input.Kind, input.Harness, input.DisplayName, input.Branch, input.Prompt, input.ProjectID).Scan(
+	`, sessionID, accountID, input.Kind, input.Harness, input.DisplayName, input.Branch, input.Prompt, input.ProjectID,
+		mode, deniedCommands).Scan(
 		&session.ID,
 		&session.AccountID,
 		&session.OrgID,
@@ -620,6 +634,8 @@ func (s *Store) CreateSession(
 		&session.DisplayName,
 		&session.Branch,
 		&session.Prompt,
+		&session.Mode,
+		&session.DeniedCommands,
 		&session.ActivityState,
 		&session.IsTerminated,
 		&session.AgentSessionID,
@@ -662,14 +678,20 @@ func (s *Store) CreateSession(
 	if err != nil {
 		return CreateSessionResult{}, fmt.Errorf("encode resource profile: %w", err)
 	}
+	// Lifetime cap: honor the requested auto-stop, defaulting to 30 minutes when
+	// unset so behavior matches the previous hardcoded value.
+	autoStopMinutes := input.AutoStopMinutes
+	if autoStopMinutes <= 0 {
+		autoStopMinutes = 30
+	}
 	var resourceRaw []byte
 	var sandbox clouddomain.Sandbox
 	err = tx.QueryRow(ctx, `
 		INSERT INTO ao_sandboxes (
 			session_id, account_id, org_id, provider, provider_connection_id,
-			desired_state, observed_state, resource_profile
+			desired_state, observed_state, resource_profile, auto_stop_minutes
 		)
-		SELECT $1, $2, $2, $5, connection.id, 'running', 'requested', $3
+		SELECT $1, $2, $2, $5, connection.id, 'running', 'requested', $3, $6
 		FROM (SELECT 1) seed
 		LEFT JOIN ao_provider_connections connection
 			ON connection.org_id = $2
@@ -678,9 +700,9 @@ func (s *Store) CreateSession(
 		RETURNING session_id, account_id, org_id, provider,
 			COALESCE(provider_environment_id, ''),
 			COALESCE(provider_connection_id::text, ''),
-			desired_state, observed_state, resource_profile, worker_last_seen_at,
+			desired_state, observed_state, resource_profile, auto_stop_minutes, worker_last_seen_at,
 			last_error, reconcile_after, created_at, updated_at
-	`, session.ID, accountID, resourceJSON, input.ProviderConnectionID, input.Provider).Scan(
+	`, session.ID, accountID, resourceJSON, input.ProviderConnectionID, input.Provider, autoStopMinutes).Scan(
 		&sandbox.SessionID,
 		&sandbox.AccountID,
 		&sandbox.OrgID,
@@ -690,6 +712,7 @@ func (s *Store) CreateSession(
 		&sandbox.DesiredState,
 		&sandbox.ObservedState,
 		&resourceRaw,
+		&sandbox.AutoStopMinutes,
 		&sandbox.WorkerLastSeenAt,
 		&sandbox.LastError,
 		&sandbox.ReconcileAfter,
@@ -829,7 +852,7 @@ func loadCreateSessionResult(
 	var existingInput CreateSessionInput
 	if receipt.Kind != "session.create" ||
 		json.Unmarshal(payloadRaw, &existingInput) != nil ||
-		existingInput != expectedInput {
+		!reflect.DeepEqual(existingInput, expectedInput) {
 		return CreateSessionResult{}, ErrIdempotencyConflict
 	}
 	_ = json.Unmarshal(resultRaw, &receipt.Result)

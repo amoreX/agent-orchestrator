@@ -158,15 +158,22 @@ type PRClaim struct {
 
 // Session records the durable state of a cloud agent session.
 type Session struct {
-	ID               SessionID `json:"id"`
-	AccountID        AccountID `json:"accountId"`
-	OrgID            OrgID     `json:"orgId"`
-	ProjectID        ProjectID `json:"projectId"`
-	Kind             string    `json:"kind"`
-	Harness          string    `json:"harness"`
-	DisplayName      string    `json:"displayName"`
-	Branch           string    `json:"branch"`
-	Prompt           string    `json:"-"`
+	ID          SessionID `json:"id"`
+	AccountID   AccountID `json:"accountId"`
+	OrgID       OrgID     `json:"orgId"`
+	ProjectID   ProjectID `json:"projectId"`
+	Kind        string    `json:"kind"`
+	Harness     string    `json:"harness"`
+	DisplayName string    `json:"displayName"`
+	Branch      string    `json:"branch"`
+	Prompt      string    `json:"-"`
+	// Mode is the sandbox capability policy: read-only | standard | trusted.
+	// It is carried to the worker and applied to the agent launch (permission
+	// mode + read-only tool allow/deny). Empty is treated as trusted.
+	Mode string `json:"mode"`
+	// DeniedCommands are bash patterns the agent is blocked from running,
+	// enforced as claude permissions.deny rules (defense-in-depth, not a wall).
+	DeniedCommands   []string  `json:"deniedCommands,omitempty"`
 	ActivityState    string    `json:"activityState"`
 	IsTerminated     bool      `json:"isTerminated"`
 	AgentSessionID   string    `json:"agentSessionId,omitempty"`
@@ -207,6 +214,29 @@ func DefaultResourceProfile() ResourceProfile {
 	return ResourceProfile{CPU: 4, Memory: 8, Disk: 10}
 }
 
+// Sandbox capability modes (see Session.Mode).
+const (
+	// SandboxModeReadOnly lets the agent read + run analysis but blocks writes,
+	// commits, pushes, and destructive ops (reviewer-style allow/deny toolset).
+	SandboxModeReadOnly = "read-only"
+	// SandboxModeStandard is normal autonomy: edits + commit + push to its branch,
+	// dangerous ops still gated.
+	SandboxModeStandard = "standard"
+	// SandboxModeTrusted is unrestricted (bypass permissions) — current behavior.
+	SandboxModeTrusted = "trusted"
+)
+
+// NormalizeSandboxMode maps a raw/empty mode onto a known value, defaulting to
+// trusted so a session with no explicit policy behaves as it did before.
+func NormalizeSandboxMode(mode string) string {
+	switch mode {
+	case SandboxModeReadOnly, SandboxModeStandard, SandboxModeTrusted:
+		return mode
+	default:
+		return SandboxModeTrusted
+	}
+}
+
 // Sandbox records desired and observed state for a session environment.
 type Sandbox struct {
 	SessionID             SessionID       `json:"sessionId"`
@@ -218,11 +248,14 @@ type Sandbox struct {
 	DesiredState          string          `json:"desiredState"`
 	ObservedState         string          `json:"observedState"`
 	ResourceProfile       ResourceProfile `json:"resourceProfile"`
-	WorkerLastSeenAt      *time.Time      `json:"workerLastSeenAt,omitempty"`
-	LastError             string          `json:"lastError,omitempty"`
-	ReconcileAfter        time.Time       `json:"reconcileAfter"`
-	CreatedAt             time.Time       `json:"createdAt"`
-	UpdatedAt             time.Time       `json:"updatedAt"`
+	// AutoStopMinutes caps the sandbox's idle lifetime. 0 means the reconciler's
+	// default (30) is used, preserving pre-policy behavior.
+	AutoStopMinutes  int        `json:"autoStopMinutes,omitempty"`
+	WorkerLastSeenAt *time.Time `json:"workerLastSeenAt,omitempty"`
+	LastError        string     `json:"lastError,omitempty"`
+	ReconcileAfter   time.Time  `json:"reconcileAfter"`
+	CreatedAt        time.Time  `json:"createdAt"`
+	UpdatedAt        time.Time  `json:"updatedAt"`
 }
 
 // Event is an ordered durable session event.

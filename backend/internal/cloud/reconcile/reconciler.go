@@ -327,12 +327,24 @@ func (r *Reconciler) workerSpec(
 	if err != nil {
 		return cloudsandbox.Spec{}, err
 	}
+	// Honor the session's chosen resource profile (part of its security policy);
+	// fall back to the default when the sandbox record carries none, so behavior
+	// is unchanged for sessions created before per-session sizing.
+	resource := sandbox.ResourceProfile
+	if resource == (clouddomain.ResourceProfile{}) {
+		resource = clouddomain.DefaultResourceProfile()
+	}
+	// Honor the session's lifetime cap; default to 30 minutes when unset.
+	autoStopMinutes := sandbox.AutoStopMinutes
+	if autoStopMinutes <= 0 {
+		autoStopMinutes = 30
+	}
 	return cloudsandbox.Spec{
 		Name:            "ao-" + string(sandbox.SessionID),
 		SessionID:       sandbox.SessionID,
 		Snapshot:        r.workerSnapshot,
 		Image:           r.workerImage,
-		ResourceProfile: clouddomain.ResourceProfile{CPU: 4, Memory: 8, Disk: 10},
+		ResourceProfile: resource,
 		Environment: map[string]string{
 			"AO_CLOUD_PUBLIC_URL":       r.publicURL,
 			"AO_CLOUD_SESSION_ID":       string(sandbox.SessionID),
@@ -348,7 +360,7 @@ func (r *Reconciler) workerSpec(
 			"ao.account_id": string(sandbox.AccountID),
 			"ao.managed":    "true",
 		},
-		AutoStopMinutes:   30,
+		AutoStopMinutes:   autoStopMinutes,
 		AutoDeleteMinutes: 7 * 24 * 60,
 	}, nil
 }

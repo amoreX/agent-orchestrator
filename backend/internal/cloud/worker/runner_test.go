@@ -38,7 +38,7 @@ func TestPrepareClaudeCloudExperienceSkipsFirstRunPrompts(t *testing.T) {
 	); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
-	if err := prepareClaudeCloudExperience(home); err != nil {
+	if err := prepareClaudeCloudExperience(home, sandboxLaunchPolicy{settingsMode: "bypassPermissions"}); err != nil {
 		t.Fatalf("prepareClaudeCloudExperience() error = %v", err)
 	}
 
@@ -62,7 +62,7 @@ func TestPrepareClaudeCloudExperienceUsesConfiguredDirectory(t *testing.T) {
 	configDir := filepath.Join(home, "persistent-claude")
 	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
 
-	if err := prepareClaudeCloudExperience(home); err != nil {
+	if err := prepareClaudeCloudExperience(home, sandboxLaunchPolicy{settingsMode: "bypassPermissions"}); err != nil {
 		t.Fatalf("prepareClaudeCloudExperience() error = %v", err)
 	}
 	root := readJSONObject(t, filepath.Join(configDir, ".claude.json"))
@@ -73,6 +73,92 @@ func TestPrepareClaudeCloudExperienceUsesConfiguredDirectory(t *testing.T) {
 	if settings["skipDangerousModePermissionPrompt"] != true {
 		t.Fatalf("configured Claude settings = %#v", settings)
 	}
+}
+
+func TestDeriveSandboxLaunchPolicy(t *testing.T) {
+	cases := []struct {
+		name       string
+		session    clouddomain.Session
+		perm       ports.PermissionMode
+		settings   string
+		wantAllow  []string
+		wantDenied []string
+	}{
+		{
+			name:     "empty defaults to trusted bypass",
+			session:  clouddomain.Session{},
+			perm:     ports.PermissionModeBypassPermissions,
+			settings: "bypassPermissions",
+		},
+		{
+			name:     "standard uses acceptEdits",
+			session:  clouddomain.Session{Mode: clouddomain.SandboxModeStandard},
+			perm:     ports.PermissionModeAcceptEdits,
+			settings: "acceptEdits",
+		},
+		{
+			name:       "read-only uses the reviewer toolset off a non-bypass mode",
+			session:    clouddomain.Session{Mode: clouddomain.SandboxModeReadOnly},
+			perm:       ports.PermissionModeAuto,
+			settings:   "default",
+			wantAllow:  readOnlyAllowedTools,
+			wantDenied: readOnlyDeniedTools,
+		},
+		{
+			name:       "trusted with denied commands steps off bypass so denies apply",
+			session:    clouddomain.Session{Mode: clouddomain.SandboxModeTrusted, DeniedCommands: []string{"git push --force"}},
+			perm:       ports.PermissionModeAcceptEdits,
+			settings:   "acceptEdits",
+			wantDenied: []string{"Bash(git push --force)"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := deriveSandboxLaunchPolicy(tc.session)
+			if got.permission != tc.perm {
+				t.Fatalf("permission = %v, want %v", got.permission, tc.perm)
+			}
+			if got.settingsMode != tc.settings {
+				t.Fatalf("settingsMode = %q, want %q", got.settingsMode, tc.settings)
+			}
+			if tc.wantAllow != nil && !reflect.DeepEqual(got.allowedTools, tc.wantAllow) {
+				t.Fatalf("allowedTools = %v, want %v", got.allowedTools, tc.wantAllow)
+			}
+			for _, want := range tc.wantDenied {
+				if !hasTool(got.deniedTools, want) {
+					t.Fatalf("deniedTools %v missing %q", got.deniedTools, want)
+				}
+			}
+		})
+	}
+}
+
+func TestPrepareClaudeReadOnlyWritesAllowDeny(t *testing.T) {
+	home := t.TempDir()
+	policy := deriveSandboxLaunchPolicy(clouddomain.Session{Mode: clouddomain.SandboxModeReadOnly})
+	if err := prepareClaudeCloudExperience(home, policy); err != nil {
+		t.Fatalf("prepareClaudeCloudExperience() error = %v", err)
+	}
+	settings := readJSONObject(t, filepath.Join(home, ".claude", "settings.json"))
+	permissions, _ := settings["permissions"].(map[string]any)
+	if permissions["defaultMode"] != "default" {
+		t.Fatalf("defaultMode = %v, want default", permissions["defaultMode"])
+	}
+	if _, ok := permissions["allow"]; !ok {
+		t.Fatalf("read-only settings missing allow list: %#v", permissions)
+	}
+	if _, ok := permissions["deny"]; !ok {
+		t.Fatalf("read-only settings missing deny list: %#v", permissions)
+	}
+}
+
+func hasTool(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestClaudeTranscriptExistsUsesPersistentConfigDirectory(t *testing.T) {

@@ -4240,6 +4240,9 @@ function SessionForm({
     displayName: string;
     prompt: string;
     providerConnectionId?: string;
+    mode?: "read-only" | "standard" | "trusted";
+    deniedCommands?: string[];
+    maxRuntimeMinutes?: number;
   }) => Promise<void>;
 }) {
   const [displayName, setDisplayName] = useState("");
@@ -4248,6 +4251,11 @@ function SessionForm({
   const [harness, setHarness] = useState<CloudAgent | "">(
     defaultConnectedAgent(connections) ?? "",
   );
+  // Per-sandbox security policy (egress is deferred; resource sizing is V1-gated).
+  const [mode, setMode] = useState<"read-only" | "standard" | "trusted">("standard");
+  const [maxRuntimeMinutes, setMaxRuntimeMinutes] = useState(0);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [deniedCommandsText, setDeniedCommandsText] = useState("");
   return (
     <Overlay title="New cloud worker" onClose={onClose}>
       <form
@@ -4262,6 +4270,12 @@ function SessionForm({
             displayName,
             prompt,
             providerConnectionId,
+            mode,
+            maxRuntimeMinutes,
+            deniedCommands: deniedCommandsText
+              .split("\n")
+              .map((line) => line.trim())
+              .filter((line) => line.length > 0),
           });
         }}
       >
@@ -4319,6 +4333,66 @@ function SessionForm({
           placeholder="What should this worker do?"
           required
         />
+        <fieldset className="space-y-2.5 rounded-md border border-border p-3">
+          <legend className="px-1 text-xs font-medium text-white/70">
+            Security policy
+          </legend>
+          <div className="flex flex-col gap-1.5" role="radiogroup" aria-label="Capability mode">
+            {(
+              [
+                { value: "read-only", label: "Read-only", hint: "Read + analyze; no writes, commits, or pushes" },
+                { value: "standard", label: "Standard", hint: "Edit, commit, and push to its own branch" },
+                { value: "trusted", label: "Trusted", hint: "Unrestricted" },
+              ] as const
+            ).map((option) => (
+              <label key={option.value} className="flex cursor-pointer items-start gap-2 text-sm">
+                <input
+                  type="radio"
+                  name="sandbox-mode"
+                  className="mt-1"
+                  value={option.value}
+                  checked={mode === option.value}
+                  onChange={() => setMode(option.value)}
+                />
+                <span>
+                  <span className="text-white/85">{option.label}</span>
+                  <span className="block text-xs text-white/40">{option.hint}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+          <label className="flex items-center justify-between gap-2 text-sm text-white/85">
+            <span>Max runtime</span>
+            <select
+              className="rounded-md border border-border bg-background px-2 py-1 text-sm outline-none focus:border-[#4d8dff]"
+              value={maxRuntimeMinutes}
+              onChange={(event) => setMaxRuntimeMinutes(Number(event.target.value))}
+              aria-label="Max runtime"
+            >
+              <option value={0}>Default (30 min)</option>
+              <option value={60}>1 hour</option>
+              <option value={240}>4 hours</option>
+              <option value={480}>8 hours</option>
+            </select>
+          </label>
+          <button
+            type="button"
+            className="text-left text-xs text-white/45 hover:underline"
+            onClick={() => setShowAdvanced((value) => !value)}
+            aria-expanded={showAdvanced}
+          >
+            {showAdvanced ? "▾" : "▸"} Advanced · denied commands
+          </button>
+          {showAdvanced ? (
+            <textarea
+              className="min-h-20 w-full resize-y rounded-md border border-border bg-background p-2 font-mono text-xs outline-none focus:border-[#4d8dff]"
+              value={deniedCommandsText}
+              onChange={(event) => setDeniedCommandsText(event.target.value)}
+              placeholder={"One pattern per line, e.g.\ngit push --force\nrm -rf /\n\nDefense-in-depth, not a hard wall."}
+              aria-label="Denied command patterns"
+            />
+          ) : null}
+        </fieldset>
         <div className="flex justify-end gap-2">
           <button type="button" className={button} onClick={onClose}>
             Cancel
