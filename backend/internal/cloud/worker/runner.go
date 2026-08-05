@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/creack/pty"
 
@@ -31,7 +32,15 @@ const (
 	terminalOutputMaxAttempts = 5
 	terminalOutputQueueWait   = time.Second
 	terminalOutputAttemptTTL  = 5 * time.Second
+	cloudGitAuthorName        = "AO Cloud Agent"
+	cloudGitAuthorEmail       = "noreply@aoagents.com"
+	// Match the local tmux runtime's paste-to-Enter delay. Claude's Ink TUI can
+	// render a pasted prompt before its internal composer state has caught up.
+	interactivePromptEnterDelay = 300 * time.Millisecond
 )
+
+// GitProxyUsername is the fixed username paired with a worker token for Git.
+const GitProxyUsername = "ao-worker"
 
 var errTerminalOutputQueueFull = errors.New("terminal output delivery queue is full")
 
@@ -44,6 +53,149 @@ type Runner struct {
 	credentialCommand func(context.Context, string, []string, io.Reader) error
 	outputEvent       func(context.Context, string, any) error
 	outputRetryDelay  time.Duration
+}
+
+type agentTerminalReady struct {
+	harness string
+	ready   chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	buffer  string
+}
+
+func newAgentTerminalReady(harness string) *agentTerminalReady {
+	ready := &agentTerminalReady{
+		harness: harness,
+		ready:   make(chan struct{}),
+	}
+	if harness != "claude-code" {
+		ready.markReady()
+	}
+	return ready
+}
+
+func (r *agentTerminalReady) observe(chunk []byte) {
+	if r == nil || r.harness != "claude-code" || len(chunk) == 0 {
+		return
+	}
+	r.mu.Lock()
+	r.buffer += string(chunk)
+	if len(r.buffer) > 8192 {
+		r.buffer = r.buffer[len(r.buffer)-8192:]
+	}
+	ready := claudeTerminalReady(r.buffer)
+	r.mu.Unlock()
+	if ready {
+		r.markReady()
+	}
+}
+
+func (r *agentTerminalReady) wait(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.ready:
+		return nil
+	}
+}
+
+func (r *agentTerminalReady) markReady() {
+	r.once.Do(func() {
+		close(r.ready)
+	})
+}
+
+func claudeTerminalReady(output string) bool {
+	compact := compactTerminalText(output)
+	return strings.Contains(compact, "bypasspermissions") ||
+		strings.Contains(compact, "shifttabtocycle")
+}
+
+// compactTerminalText removes terminal control sequences and all visual
+// separators before matching stable composer phrases. Ink may lay out words
+// with cursor-positioning CSI sequences instead of literal spaces, so matching
+// the rendered byte stream directly is not reliable across widths or versions.
+func compactTerminalText(value string) string {
+	plain := stripANSIControlSequences(value)
+	var compact strings.Builder
+	compact.Grow(len(plain))
+	for _, character := range strings.ToLower(plain) {
+		if unicode.IsLetter(character) || unicode.IsNumber(character) {
+			compact.WriteRune(character)
+		}
+	}
+	return compact.String()
+}
+
+func stripANSIControlSequences(value string) string {
+	var plain strings.Builder
+	plain.Grow(len(value))
+	for index := 0; index < len(value); index++ {
+		switch value[index] {
+		case '\x1b':
+			if index+1 >= len(value) {
+				continue
+			}
+			index++
+			switch value[index] {
+			case '[':
+				index = skipANSICSI(value, index+1)
+			case ']', 'P', '^', '_':
+				index = skipANSIString(value, index+1)
+			default:
+				// Two-byte ESC controls include save/restore cursor, keypad
+				// modes, and reset. For controls with intermediate bytes,
+				// consume through the first final byte.
+				for index+1 < len(value) &&
+					value[index] >= 0x20 &&
+					value[index] <= 0x2f {
+					index++
+				}
+			}
+		case '\x9b':
+			index = skipANSICSI(value, index+1)
+		default:
+			plain.WriteByte(value[index])
+		}
+	}
+	return plain.String()
+}
+
+func skipANSICSI(value string, index int) int {
+	for index < len(value) {
+		if value[index] >= 0x40 && value[index] <= 0x7e {
+			return index
+		}
+		index++
+	}
+	return len(value) - 1
+}
+
+func skipANSIString(value string, index int) int {
+	for index < len(value) {
+		switch {
+		case value[index] == '\a':
+			return index
+		case value[index] == '\x1b' &&
+			index+1 < len(value) &&
+			value[index+1] == '\\':
+			return index + 1
+		default:
+			index++
+		}
+	}
+	return len(value) - 1
+}
+
+func promptDeliveryCanWaitForTerminal(
+	agentReady bool,
+	terminalReady *agentTerminalReady,
+) bool {
+	return agentReady ||
+		(terminalReady != nil && terminalReady.harness == "claude-code")
 }
 
 // NewRunner creates a worker runner from bootstrap launch data.
@@ -66,6 +218,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := os.MkdirAll(r.dataDir, 0o700); err != nil {
 		return fmt.Errorf("create worker data dir: %w", err)
 	}
+	if err := os.Setenv("AO_DATA_DIR", r.dataDir); err != nil {
+		return fmt.Errorf("set worker data dir: %w", err)
+	}
+	r.client.acceptToken(r.client.getToken())
 	if err := prepareWorkerHome(); err != nil {
 		return err
 	}
@@ -89,11 +245,8 @@ func (r *Runner) Run(ctx context.Context) error {
 		DataDir:     r.dataDir,
 		Kind:        shareddomain.SessionKind(r.bootstrap.Launch.Session.Kind),
 		Permissions: ports.PermissionModeBypassPermissions,
-		// Cloud prompts are delivered through the durable worker command stream
-		// after the interactive agent PTY has started. Passing one in argv makes
-		// some harnesses prefill their composer without submitting the task.
-		Prompt:    "",
-		SessionID: string(r.bootstrap.Launch.Session.ID),
+		Prompt:      r.bootstrap.Launch.PendingPrompt,
+		SessionID:   string(r.bootstrap.Launch.Session.ID),
 		SystemPrompt: systemPrompt(
 			r.bootstrap.Launch.Session.Kind,
 			string(r.bootstrap.Launch.Session.ProjectID),
@@ -120,7 +273,10 @@ func (r *Runner) Run(ctx context.Context) error {
 			return fmt.Errorf("prepare agent launch: %w", err)
 		}
 	}
-	hookEnvironment := workerEnvironment(r.client.getToken())
+	hookEnvironment := workerEnvironment(
+		r.client.getToken(),
+		r.bootstrap.Launch.RepositoryURL,
+	)
 	hookEnvironment["AO_SESSION_BRANCH"] = r.bootstrap.Launch.Session.Branch
 	if augmenter, ok := agent.(interface {
 		AugmentRuntimeEnv(map[string]string, string)
@@ -135,6 +291,16 @@ func (r *Runner) Run(ctx context.Context) error {
 		WorkspacePath: r.workspaceDir,
 	}); err != nil {
 		return fmt.Errorf("install agent hooks: %w", err)
+	}
+	commandPromptSequence, err := prepareCloudPromptDelivery(
+		ctx,
+		agent,
+		&launchConfig,
+		r.bootstrap.Launch.PendingPromptSequence,
+		restoreAgent,
+	)
+	if err != nil {
+		return err
 	}
 	argv, err := cloudAgentCommand(
 		ctx,
@@ -167,9 +333,18 @@ func (r *Runner) Run(ctx context.Context) error {
 	clearEnvironmentSecret(hookEnvironment, credentialEnvironmentName)
 	workspaceEnvironment := append(
 		sanitizedProcessEnvironment(),
-		envList(workspaceShellEnvironment(r.bootstrap.Launch.Session.Branch))...,
+		envList(workspaceShellEnvironment(
+			r.bootstrap.Launch.Session.Branch,
+			r.bootstrap.Launch.RepositoryURL,
+		))...,
 	)
-	return r.runInteractiveAgent(ctx, argv, agentEnvironment, workspaceEnvironment)
+	return r.runInteractiveAgent(
+		ctx,
+		argv,
+		agentEnvironment,
+		workspaceEnvironment,
+		commandPromptSequence,
+	)
 }
 
 func prepareWorkerHome() error {
@@ -206,7 +381,33 @@ func shouldRestoreAgentSession(
 
 type cloudAgentLauncher interface {
 	GetLaunchCommand(context.Context, ports.LaunchConfig) ([]string, error)
+	GetPromptDeliveryStrategy(context.Context, ports.LaunchConfig) (ports.PromptDeliveryStrategy, error)
 	GetRestoreCommand(context.Context, ports.RestoreConfig) ([]string, bool, error)
+}
+
+func prepareCloudPromptDelivery(
+	ctx context.Context,
+	agent cloudAgentLauncher,
+	launchConfig *ports.LaunchConfig,
+	promptSequence int64,
+	restore bool,
+) (int64, error) {
+	if launchConfig == nil {
+		return 0, errors.New("cloud launch config is required")
+	}
+	if restore || promptSequence <= 0 || launchConfig.Prompt == "" {
+		launchConfig.Prompt = ""
+		return 0, nil
+	}
+	delivery, err := agent.GetPromptDeliveryStrategy(ctx, *launchConfig)
+	if err != nil {
+		return 0, fmt.Errorf("resolve cloud prompt delivery: %w", err)
+	}
+	if delivery == ports.PromptDeliveryAfterStart {
+		launchConfig.Prompt = ""
+		return 0, nil
+	}
+	return promptSequence, nil
 }
 
 func cloudAgentCommand(
@@ -252,6 +453,7 @@ func (r *Runner) runInteractiveAgent(
 	argv []string,
 	agentEnvironment []string,
 	workspaceEnvironment []string,
+	commandPromptSequence int64,
 ) error {
 	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	command.Dir = r.workspaceDir
@@ -277,6 +479,7 @@ func (r *Runner) runInteractiveAgent(
 	}()
 	var terminalWriteMu sync.Mutex
 	var workspaceWriteMu sync.Mutex
+	agentTerminalReady := newAgentTerminalReady(r.bootstrap.Launch.Session.Harness)
 	go func() {
 		err := r.streamOutput(ctx, workspaceTerminal, "workspace_terminal.output")
 		if err != nil &&
@@ -308,13 +511,15 @@ func (r *Runner) runInteractiveAgent(
 		r.commandLoop(
 			commandCtx,
 			terminal,
+			agentTerminalReady,
 			workspaceTerminal,
 			&terminalWriteMu,
 			&workspaceWriteMu,
+			commandPromptSequence,
 		)
 	}()
 
-	readErr := r.streamOutput(ctx, terminal, "terminal.output")
+	readErr := r.streamOutput(ctx, terminal, "terminal.output", agentTerminalReady.observe)
 	if readErr != nil &&
 		!errors.Is(readErr, io.EOF) &&
 		ctx.Err() == nil &&
@@ -345,13 +550,16 @@ func (r *Runner) runInteractiveAgent(
 func (r *Runner) commandLoop(
 	ctx context.Context,
 	terminal *os.File,
+	agentTerminalReady *agentTerminalReady,
 	workspaceTerminal *os.File,
 	writeMu *sync.Mutex,
 	workspaceWriteMu *sync.Mutex,
+	commandPromptSequence int64,
 ) {
 	backoff := time.Second
 	var highestPrompt atomic.Int64
-	var acknowledgedPrompt int64
+	highestPrompt.Store(commandPromptSequence)
+	acknowledgedPrompt := commandPromptSequence
 	agentReady := false
 	pendingPrompts := make([]cloudworkerhub.Command, 0, 1)
 	deliverPrompt := func(command cloudworkerhub.Command) error {
@@ -362,7 +570,10 @@ func (r *Runner) commandLoop(
 		if err != nil {
 			return fmt.Errorf("decode prompt: %w", err)
 		}
-		if err := submitInteractivePrompt(ctx, terminal, writeMu, decoded, 100*time.Millisecond); err != nil {
+		if err := agentTerminalReady.wait(ctx); err != nil {
+			return err
+		}
+		if err := submitInteractivePrompt(ctx, terminal, writeMu, decoded, interactivePromptEnterDelay); err != nil {
 			return err
 		}
 		if command.Sequence > 0 {
@@ -388,65 +599,73 @@ func (r *Runner) commandLoop(
 			acknowledgedPrompt = highest
 		}
 		connectionStartedAt := time.Now()
-		err := r.client.RunCommandStream(ctx, highestPrompt.Load(), func(command cloudworkerhub.Command) error {
-			switch command.Type {
-			case "workspace_request":
-				r.dispatchWorkspaceCommand(ctx, command)
-				return nil
-			case "input":
-				decoded, err := base64.StdEncoding.DecodeString(command.Data)
-				if err != nil {
-					return fmt.Errorf("decode terminal input: %w", err)
-				}
-				writeMu.Lock()
-				_, err = terminal.Write(decoded)
-				writeMu.Unlock()
-				return err
-			case "workspace_terminal_input":
-				decoded, err := base64.StdEncoding.DecodeString(command.Data)
-				if err != nil {
-					return fmt.Errorf("decode workspace terminal input: %w", err)
-				}
-				workspaceWriteMu.Lock()
-				_, err = workspaceTerminal.Write(decoded)
-				workspaceWriteMu.Unlock()
-				return err
-			case "agent_ready":
-				agentReady = true
-				for _, prompt := range pendingPrompts {
-					if err := deliverPrompt(prompt); err != nil {
+		err := r.client.RunCommandStream(
+			ctx,
+			highestPrompt.Load(),
+			commandPromptSequence,
+			func(command cloudworkerhub.Command) error {
+				switch command.Type {
+				case "workspace_request":
+					r.dispatchWorkspaceCommand(ctx, command)
+					return nil
+				case "input":
+					if !terminalInputAllowed(agentReady) {
+						return nil
+					}
+					decoded, err := base64.StdEncoding.DecodeString(command.Data)
+					if err != nil {
+						return fmt.Errorf("decode terminal input: %w", err)
+					}
+					writeMu.Lock()
+					_, err = terminal.Write(decoded)
+					writeMu.Unlock()
+					return err
+				case "workspace_terminal_input":
+					decoded, err := base64.StdEncoding.DecodeString(command.Data)
+					if err != nil {
+						return fmt.Errorf("decode workspace terminal input: %w", err)
+					}
+					workspaceWriteMu.Lock()
+					_, err = workspaceTerminal.Write(decoded)
+					workspaceWriteMu.Unlock()
+					return err
+				case "agent_ready":
+					agentReady = true
+					for _, prompt := range pendingPrompts {
+						if err := deliverPrompt(prompt); err != nil {
+							return err
+						}
+					}
+					pendingPrompts = pendingPrompts[:0]
+					return nil
+				case "prompt":
+					if command.Sequence > 0 && command.Sequence <= highestPrompt.Load() {
+						return nil
+					}
+					if !promptDeliveryCanWaitForTerminal(agentReady, agentTerminalReady) {
+						pendingPrompts = append(pendingPrompts, command)
+						return nil
+					}
+					return deliverPrompt(command)
+				case "resize":
+					return pty.Setsize(terminal, &pty.Winsize{Rows: command.Rows, Cols: command.Cols})
+				case "workspace_terminal_resize":
+					return pty.Setsize(workspaceTerminal, &pty.Winsize{Rows: command.Rows, Cols: command.Cols})
+				case "keepalive":
+					return nil
+				case "interrupt":
+					writeMu.Lock()
+					_, err := terminal.Write([]byte{3})
+					writeMu.Unlock()
+					if err != nil {
 						return err
 					}
+					return r.reportTurnInterrupted(ctx, command.Sequence)
+				default:
+					return fmt.Errorf("unsupported worker command %q", command.Type)
 				}
-				pendingPrompts = pendingPrompts[:0]
-				return nil
-			case "prompt":
-				if command.Sequence > 0 && command.Sequence <= highestPrompt.Load() {
-					return nil
-				}
-				if !agentReady {
-					pendingPrompts = append(pendingPrompts, command)
-					return nil
-				}
-				return deliverPrompt(command)
-			case "resize":
-				return pty.Setsize(terminal, &pty.Winsize{Rows: command.Rows, Cols: command.Cols})
-			case "workspace_terminal_resize":
-				return pty.Setsize(workspaceTerminal, &pty.Winsize{Rows: command.Rows, Cols: command.Cols})
-			case "keepalive":
-				return nil
-			case "interrupt":
-				writeMu.Lock()
-				_, err := terminal.Write([]byte{3})
-				writeMu.Unlock()
-				if err != nil {
-					return err
-				}
-				return r.reportTurnInterrupted(ctx, command.Sequence)
-			default:
-				return fmt.Errorf("unsupported worker command %q", command.Type)
-			}
-		})
+			},
+		)
 		if ctx.Err() != nil {
 			return
 		}
@@ -462,6 +681,10 @@ func (r *Runner) commandLoop(
 			backoff *= 2
 		}
 	}
+}
+
+func terminalInputAllowed(agentReady bool) bool {
+	return agentReady
 }
 
 func submitInteractivePrompt(
@@ -495,11 +718,23 @@ func (r *Runner) prepareRepository(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	workerGitHelperPath := ""
+	if localGitHubTokenPath == "" {
+		workerGitHelperPath, err = r.prepareWorkerGitCredentialHelper()
+		if err != nil {
+			return err
+		}
+	}
 	if info, err := os.Stat(filepath.Join(r.workspaceDir, ".git")); err == nil && info.IsDir() {
 		if localGitHubTokenPath != "" {
 			if err := r.configureLocalGitHubCredential(ctx, localGitHubTokenPath); err != nil {
 				return err
 			}
+		} else if err := r.configureWorkerGitCredential(ctx, workerGitHelperPath); err != nil {
+			return err
+		}
+		if err := r.configureWorkerGitIdentity(ctx); err != nil {
+			return err
 		}
 		if err := r.checkoutBranch(ctx); err != nil {
 			return err
@@ -520,9 +755,13 @@ func (r *Runner) prepareRepository(ctx context.Context) error {
 			return err
 		}
 		commandEnvironment = append(commandEnvironment,
-			"GIT_CONFIG_COUNT=1",
-			"GIT_CONFIG_KEY_0=http.extraHeader",
-			"GIT_CONFIG_VALUE_0=Authorization: Worker "+r.client.getToken(),
+			"GIT_CONFIG_COUNT=3",
+			"GIT_CONFIG_KEY_0=credential.helper",
+			"GIT_CONFIG_VALUE_0=",
+			"GIT_CONFIG_KEY_1=credential.helper",
+			"GIT_CONFIG_VALUE_1="+workerGitHelperPath,
+			"GIT_CONFIG_KEY_2=credential.useHttpPath",
+			"GIT_CONFIG_VALUE_2=true",
 		)
 	} else {
 		credential := base64.StdEncoding.EncodeToString(
@@ -553,6 +792,11 @@ func (r *Runner) prepareRepository(ctx context.Context) error {
 		if err := r.configureLocalGitHubCredential(ctx, localGitHubTokenPath); err != nil {
 			return err
 		}
+	} else if err := r.configureWorkerGitCredential(ctx, workerGitHelperPath); err != nil {
+		return err
+	}
+	if err := r.configureWorkerGitIdentity(ctx); err != nil {
+		return err
 	}
 	if err := r.checkoutBranch(ctx); err != nil {
 		return err
@@ -599,20 +843,111 @@ func (r *Runner) persistLocalGitHubToken() (string, error) {
 	return path, nil
 }
 
+func (r *Runner) prepareWorkerGitCredentialHelper() (string, error) {
+	if err := os.MkdirAll(r.dataDir, 0o700); err != nil {
+		return "", fmt.Errorf("create worker Git credential directory: %w", err)
+	}
+	tokenPath := filepath.Join(r.dataDir, "worker-token")
+	tokenInfo, err := os.Lstat(tokenPath)
+	if err != nil {
+		return "", fmt.Errorf("inspect worker token for Git credential helper: %w", err)
+	}
+	if !tokenInfo.Mode().IsRegular() {
+		return "", errors.New("worker token for Git credential helper is not a regular file")
+	}
+	if err := os.Chmod(tokenPath, 0o600); err != nil {
+		return "", fmt.Errorf("secure worker token for Git credential helper: %w", err)
+	}
+	helper := fmt.Sprintf(`#!/bin/sh
+if [ "$1" != "get" ]; then
+  exit 0
+fi
+token="$(cat %s)" || exit 1
+printf 'username=%s\npassword=%%s\n' "$token"
+`, shellQuote(tokenPath), GitProxyUsername)
+	temporary, err := os.CreateTemp(r.dataDir, ".git-credential-worker-*")
+	if err != nil {
+		return "", fmt.Errorf("create worker Git credential helper: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if err := temporary.Chmod(0o700); err != nil {
+		_ = temporary.Close()
+		return "", fmt.Errorf("secure worker Git credential helper: %w", err)
+	}
+	if _, err := temporary.WriteString(helper); err != nil {
+		_ = temporary.Close()
+		return "", fmt.Errorf("write worker Git credential helper: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return "", fmt.Errorf("close worker Git credential helper: %w", err)
+	}
+	path := filepath.Join(r.dataDir, "git-credential-worker")
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return "", fmt.Errorf("persist worker Git credential helper: %w", err)
+	}
+	return path, nil
+}
+
+func (r *Runner) configureWorkerGitCredential(ctx context.Context, helperPath string) error {
+	proxyURL, err := cloudlocalgh.ProxyURL(
+		os.Getenv("AO_CLOUD_PUBLIC_URL"),
+		r.bootstrap.Launch.RepositoryURL,
+	)
+	if err != nil {
+		return err
+	}
+	commands := [][]string{
+		{"remote", "set-url", "origin", proxyURL},
+		{"config", "--local", "--replace-all", "credential.helper", ""},
+		{"config", "--local", "--add", "credential.helper", helperPath},
+		{"config", "--local", "--replace-all", "credential.useHttpPath", "true"},
+	}
+	for _, arguments := range commands {
+		// #nosec G702 -- git is fixed and each value is passed as a discrete argument without a shell.
+		command := exec.CommandContext(ctx, "git", append([]string{"-C", r.workspaceDir}, arguments...)...)
+		if output, err := command.CombinedOutput(); err != nil {
+			return fmt.Errorf(
+				"configure worker Git credential: %w: %s",
+				err,
+				strings.TrimSpace(string(output)),
+			)
+		}
+	}
+	return nil
+}
+
 func (r *Runner) configureLocalGitHubCredential(ctx context.Context, tokenPath string) error {
 	helper := `!f() { test "$1" = get || exit 0; ` +
 		`printf 'username=x-access-token\npassword=%s\n' "$(cat ` +
 		shellQuote(tokenPath) + `)"; }; f`
 	commands := [][]string{
 		{"remote", "set-url", "origin", r.bootstrap.Launch.RepositoryURL},
-		{"config", "--local", "credential.helper", ""},
-		{"config", "--local", "credential.https://github.com.helper", helper},
+		{"config", "--local", "--replace-all", "credential.helper", ""},
+		{"config", "--local", "--replace-all", "credential.https://github.com.helper", helper},
 	}
 	for _, arguments := range commands {
 		command := exec.CommandContext(ctx, "git", append([]string{"-C", r.workspaceDir}, arguments...)...)
 		if output, err := command.CombinedOutput(); err != nil {
 			return fmt.Errorf(
 				"configure local GitHub credential: %w: %s",
+				err,
+				strings.TrimSpace(string(output)),
+			)
+		}
+	}
+	return nil
+}
+
+func (r *Runner) configureWorkerGitIdentity(ctx context.Context) error {
+	for _, arguments := range [][]string{
+		{"config", "--local", "--replace-all", "user.name", cloudGitAuthorName},
+		{"config", "--local", "--replace-all", "user.email", cloudGitAuthorEmail},
+	} {
+		command := exec.CommandContext(ctx, "git", append([]string{"-C", r.workspaceDir}, arguments...)...)
+		if output, err := command.CombinedOutput(); err != nil {
+			return fmt.Errorf(
+				"configure worker Git identity: %w: %s",
 				err,
 				strings.TrimSpace(string(output)),
 			)
@@ -660,7 +995,12 @@ fi
 	return nil
 }
 
-func (r *Runner) streamOutput(ctx context.Context, terminal io.Reader, eventType string) error {
+func (r *Runner) streamOutput(
+	ctx context.Context,
+	terminal io.Reader,
+	eventType string,
+	observers ...func([]byte),
+) error {
 	deliveryContext, cancelDelivery := context.WithCancel(ctx)
 	defer cancelDelivery()
 	output := make(chan []byte, terminalOutputQueueDepth)
@@ -672,6 +1012,11 @@ func (r *Runner) streamOutput(ctx context.Context, terminal io.Reader, eventType
 			count, err := terminal.Read(buffer)
 			if count > 0 {
 				chunk := append([]byte(nil), buffer[:count]...)
+				for _, observe := range observers {
+					if observe != nil {
+						observe(chunk)
+					}
+				}
 				select {
 				case output <- chunk:
 				case <-ctx.Done():
@@ -1007,21 +1352,33 @@ func updateJSONFile(path string, update func(map[string]any)) error {
 	return nil
 }
 
-func workerEnvironment(token string) map[string]string {
-	return map[string]string{
+func workerEnvironment(token, repositoryURL string) map[string]string {
+	environment := map[string]string{
 		"AO_CLOUD_PUBLIC_URL": os.Getenv("AO_CLOUD_PUBLIC_URL"),
 		"AO_WORKER_TOKEN":     token,
 		"AO_SESSION_ID":       os.Getenv("AO_CLOUD_SESSION_ID"),
 		"AO_DATA_DIR":         os.Getenv("AO_DATA_DIR"),
 	}
+	addGitHubRepositoryEnvironment(environment, repositoryURL)
+	return environment
 }
 
-func workspaceShellEnvironment(branch string) map[string]string {
-	return map[string]string{
+func workspaceShellEnvironment(branch, repositoryURL string) map[string]string {
+	environment := map[string]string{
 		"AO_CLOUD_PUBLIC_URL": os.Getenv("AO_CLOUD_PUBLIC_URL"),
 		"AO_SESSION_ID":       os.Getenv("AO_CLOUD_SESSION_ID"),
 		"AO_SESSION_BRANCH":   branch,
 	}
+	addGitHubRepositoryEnvironment(environment, repositoryURL)
+	return environment
+}
+
+func addGitHubRepositoryEnvironment(environment map[string]string, repositoryURL string) {
+	owner, repository, ok := cloudlocalgh.ParseRepositoryURL(repositoryURL)
+	if !ok {
+		return
+	}
+	environment["GH_REPO"] = owner + "/" + repository
 }
 
 func sanitizedProcessEnvironment() []string {

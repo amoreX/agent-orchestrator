@@ -3,12 +3,14 @@ package httpapi
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"strconv"
 	"strings"
@@ -23,6 +25,7 @@ import (
 	clouddomain "github.com/aoagents/agent-orchestrator/backend/internal/cloud/domain"
 	cloudevents "github.com/aoagents/agent-orchestrator/backend/internal/cloud/events"
 	cloudpostgres "github.com/aoagents/agent-orchestrator/backend/internal/cloud/postgres"
+	cloudsandbox "github.com/aoagents/agent-orchestrator/backend/internal/cloud/sandbox"
 	"github.com/aoagents/agent-orchestrator/backend/internal/cloud/sandbox/daytona"
 	cloudlocalgh "github.com/aoagents/agent-orchestrator/backend/internal/cloud/scm/localgh"
 	cloudsecrets "github.com/aoagents/agent-orchestrator/backend/internal/cloud/secrets"
@@ -34,12 +37,36 @@ import (
 type store interface {
 	Ping(context.Context) error
 	EnsureAccount(context.Context, string, string) (clouddomain.Account, error)
+	ExternalAccountCanSignIn(context.Context, string, string, string) (bool, error)
+	EnsureExternalAccount(context.Context, string, string, string, string, bool) (clouddomain.Account, error)
+	UpdateUserProfile(context.Context, string, cloudpostgres.UpdateUserProfileInput) (clouddomain.User, error)
+	CreateOrganization(context.Context, cloudpostgres.CreateOrganizationInput) (clouddomain.UserOrganization, error)
+	UpdateOrganization(context.Context, clouddomain.OrgID, cloudpostgres.UpdateOrganizationInput) (clouddomain.Organization, error)
+	ListUserOrganizations(context.Context, string) ([]clouddomain.UserOrganization, error)
+	GetOrgMembership(context.Context, string, clouddomain.OrgID) (clouddomain.UserOrganization, error)
+	ListOrgMembers(context.Context, clouddomain.OrgID) ([]clouddomain.OrgMember, error)
+	UpdateOrgMemberRole(context.Context, clouddomain.OrgID, string, string) (clouddomain.OrgMember, error)
+	CreateOrgInvitation(context.Context, clouddomain.OrgID, cloudpostgres.CreateOrgInvitationInput) (clouddomain.OrgInvitation, error)
+	ListOrgInvitations(context.Context, clouddomain.OrgID) ([]clouddomain.OrgInvitation, error)
+	ListUserInvitations(context.Context, string, string) ([]clouddomain.OrgInvitation, error)
+	AcceptOrgInvitation(context.Context, string, string, string) (clouddomain.OrgMembership, error)
+	DeclineOrgInvitation(context.Context, string, string, string) error
+	RevokeOrgInvitation(context.Context, clouddomain.OrgID, string) error
 	CreateProject(context.Context, clouddomain.AccountID, cloudpostgres.CreateProjectInput) (clouddomain.Project, error)
 	ListProjects(context.Context, clouddomain.AccountID) ([]clouddomain.Project, error)
 	GetProject(context.Context, clouddomain.AccountID, clouddomain.ProjectID) (clouddomain.Project, error)
+	DeleteProject(context.Context, clouddomain.AccountID, clouddomain.ProjectID) error
+	CreateProjectShareLink(context.Context, cloudpostgres.CreateProjectShareLinkInput) (cloudpostgres.ProjectShareLink, error)
+	RedeemProjectShareLink(context.Context, string, string) (cloudpostgres.SharedProjectGrant, error)
+	ListSharedProjectGrants(context.Context, string) ([]cloudpostgres.SharedProjectGrant, error)
+	ListProjectShareAccess(context.Context, clouddomain.OrgID, clouddomain.ProjectID) (cloudpostgres.ProjectShareAccess, error)
+	UpdateProjectShareGrantRole(context.Context, clouddomain.OrgID, clouddomain.ProjectID, string, string) (cloudpostgres.ProjectShareGrant, error)
+	RevokeProjectShareGrant(context.Context, clouddomain.OrgID, clouddomain.ProjectID, string) error
+	RevokeProjectShareLink(context.Context, clouddomain.OrgID, clouddomain.ProjectID, string) error
 	CreateSession(context.Context, clouddomain.AccountID, cloudpostgres.CreateSessionInput) (cloudpostgres.CreateSessionResult, error)
 	ListSessions(context.Context, clouddomain.AccountID) ([]clouddomain.Session, error)
 	GetSession(context.Context, clouddomain.AccountID, clouddomain.SessionID) (clouddomain.Session, error)
+	DeleteSession(context.Context, clouddomain.AccountID, clouddomain.SessionID) error
 	GetActiveTurn(context.Context, clouddomain.AccountID, clouddomain.SessionID) (*clouddomain.Turn, error)
 	GetLatestTurn(context.Context, clouddomain.AccountID, clouddomain.SessionID) (*clouddomain.Turn, error)
 	TransitionActiveTurn(context.Context, clouddomain.AccountID, clouddomain.SessionID, string, string) (*clouddomain.Turn, error)
@@ -58,6 +85,10 @@ type store interface {
 	LatestPromptAcceptedSequence(context.Context, clouddomain.AccountID, clouddomain.SessionID) (int64, error)
 	SetAgentSessionID(context.Context, clouddomain.AccountID, clouddomain.SessionID, string) error
 	UpsertProviderConnection(context.Context, clouddomain.AccountID, string, string, []byte, []byte, json.RawMessage) (cloudpostgres.ProviderConnection, error)
+	SetOrgProviderSettings(context.Context, clouddomain.OrgID, string) (cloudpostgres.OrgProviderSettings, error)
+	OrgProviderSettings(context.Context, clouddomain.OrgID) (cloudpostgres.OrgProviderSettings, error)
+	PersonalOrgIDForUser(context.Context, string) (clouddomain.OrgID, error)
+	ListDefaultProviderOrgsForUser(context.Context, string) ([]clouddomain.OrgID, error)
 	ListProviderConnections(context.Context, clouddomain.AccountID) ([]cloudpostgres.ProviderConnection, error)
 	ProviderConnectionSecretByProvider(context.Context, clouddomain.AccountID, string, string) ([]byte, []byte, json.RawMessage, error)
 	DeleteProviderConnection(context.Context, clouddomain.AccountID, string, string) error
@@ -69,28 +100,55 @@ type store interface {
 	MarkReviewThreadResolved(context.Context, clouddomain.AccountID, clouddomain.SessionID, string) error
 }
 
+type sandboxProviderResolver interface {
+	Resolve(context.Context, clouddomain.Sandbox) (cloudsandbox.Provider, error)
+}
+
 // Server serves the authenticated AO Cloud HTTP and WebSocket APIs.
 type Server struct {
-	store            store
-	events           *cloudevents.Service
-	auth             cloudauth.Authenticator
-	localAuth        *cloudauth.LocalAuthenticator
-	workerTokens     *cloudworker.TokenManager
-	secretCipher     *cloudsecrets.Cipher
-	agentCredentials *agentCredentialValidator
-	sandboxProvider  string
-	daytonaAPIURL    string
-	daytonaTarget    string
-	workerHub        *cloudworkerhub.Hub
-	workerRPC        *workerRPCBroker
-	previewTokens    *previewTokenStore
-	workerReplayWait time.Duration
-	workerWriteWait  time.Duration
-	localGitHub      *cloudlocalgh.Client
-	webOrigin        string
-	webOriginHost    string
-	log              *slog.Logger
-	handler          http.Handler
+	store                    store
+	events                   *cloudevents.Service
+	auth                     cloudauth.Authenticator
+	localAuth                *cloudauth.LocalAuthenticator
+	workerTokens             *cloudworker.TokenManager
+	secretCipher             *cloudsecrets.Cipher
+	agentCredentials         *agentCredentialValidator
+	sandboxProvider          string
+	maxActiveSandboxesPerOrg int
+	daytonaAPIURL            string
+	daytonaTarget            string
+	workerHub                *cloudworkerhub.Hub
+	sandboxProviders         sandboxProviderResolver
+	workerRPC                *workerRPCBroker
+	previewTokens            *previewTokenStore
+	workerReplayWait         time.Duration
+	workerWriteWait          time.Duration
+	localGitHub              *cloudlocalgh.Client
+	githubStore              githubStore
+	githubApp                *githubAppRuntime
+	webOrigin                string
+	webOriginHost            string
+	allowExternalSignup      bool
+	log                      *slog.Logger
+	handler                  http.Handler
+}
+
+// WithMaxActiveSandboxesPerOrg rejects new session creation once an org has
+// too many non-deleted sandboxes. A value of 0 disables the guard.
+func WithMaxActiveSandboxesPerOrg(limit int) Option {
+	return func(server *Server) {
+		if limit >= 0 {
+			server.maxActiveSandboxesPerOrg = limit
+		}
+	}
+}
+
+// WithSandboxProviderResolver allows destructive API paths to tear down provider
+// resources before deleting durable rows.
+func WithSandboxProviderResolver(resolver sandboxProviderResolver) Option {
+	return func(server *Server) {
+		server.sandboxProviders = resolver
+	}
 }
 
 // New creates an AO Cloud API server.
@@ -105,31 +163,41 @@ func New(
 	workerHub *cloudworkerhub.Hub,
 	localGitHub *cloudlocalgh.Client,
 	webOrigin string,
+	allowExternalSignup bool,
 	log *slog.Logger,
+	options ...Option,
 ) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
 	localAuth, _ := auth.(*cloudauth.LocalAuthenticator)
 	server := &Server{
-		store:            store,
-		events:           events,
-		auth:             auth,
-		localAuth:        localAuth,
-		workerTokens:     workerTokens,
-		secretCipher:     secretCipher,
-		agentCredentials: newAgentCredentialValidator(nil),
-		sandboxProvider:  sandboxProvider,
-		daytonaAPIURL:    strings.TrimRight(daytonaAPIURL, "/"),
-		daytonaTarget:    daytonaTarget,
-		workerHub:        workerHub,
-		workerRPC:        newWorkerRPCBroker(),
-		previewTokens:    newPreviewTokenStore(),
-		workerReplayWait: 20 * time.Second,
-		workerWriteWait:  10 * time.Second,
-		localGitHub:      localGitHub,
-		webOrigin:        strings.TrimRight(webOrigin, "/"),
-		log:              log,
+		store:                    store,
+		events:                   events,
+		auth:                     auth,
+		localAuth:                localAuth,
+		workerTokens:             workerTokens,
+		secretCipher:             secretCipher,
+		agentCredentials:         newAgentCredentialValidator(nil),
+		sandboxProvider:          sandboxProvider,
+		maxActiveSandboxesPerOrg: 10,
+		daytonaAPIURL:            strings.TrimRight(daytonaAPIURL, "/"),
+		daytonaTarget:            daytonaTarget,
+		workerHub:                workerHub,
+		workerRPC:                newWorkerRPCBroker(),
+		previewTokens:            newPreviewTokenStore(),
+		workerReplayWait:         20 * time.Second,
+		workerWriteWait:          10 * time.Second,
+		localGitHub:              localGitHub,
+		webOrigin:                strings.TrimRight(webOrigin, "/"),
+		allowExternalSignup:      allowExternalSignup,
+		log:                      log,
+	}
+	server.githubStore, _ = store.(githubStore)
+	for _, option := range options {
+		if option != nil {
+			option(server)
+		}
 	}
 	if parsed, err := url.Parse(server.webOrigin); err == nil {
 		server.webOriginHost = parsed.Host
@@ -144,10 +212,35 @@ func (s *Server) Handler() http.Handler {
 }
 
 type accountContextKey struct{}
+type orgContextKey struct{}
+type sharedProjectAccessContextKey struct{}
+
+type sharedProjectAccess struct {
+	ProjectIDs map[clouddomain.ProjectID]struct{}
+	Roles      map[clouddomain.ProjectID]string
+}
 
 func accountFromContext(ctx context.Context) (clouddomain.Account, bool) {
 	account, ok := ctx.Value(accountContextKey{}).(clouddomain.Account)
 	return account, ok
+}
+
+func orgFromContext(ctx context.Context) (clouddomain.UserOrganization, bool) {
+	org, ok := ctx.Value(orgContextKey{}).(clouddomain.UserOrganization)
+	return org, ok
+}
+
+func sharedProjectAccessFromContext(ctx context.Context) (sharedProjectAccess, bool) {
+	access, ok := ctx.Value(sharedProjectAccessContextKey{}).(sharedProjectAccess)
+	return access, ok
+}
+
+func tenantAccountIDFromContext(ctx context.Context) clouddomain.AccountID {
+	if org, ok := orgFromContext(ctx); ok {
+		return clouddomain.AccountID(org.Organization.ID)
+	}
+	account, _ := accountFromContext(ctx)
+	return account.ID
 }
 
 func (s *Server) routes() http.Handler {
@@ -171,6 +264,8 @@ func (s *Server) routes() http.Handler {
 		api.Post("/worker/bootstrap", s.workerBootstrap)
 		api.Get("/terminal", s.terminalSocket)
 		api.HandleFunc("/preview/{token}/*", s.workspacePreviewProxy)
+		api.Get("/github/install/callback", s.githubInstallCallback)
+		api.Post("/github/webhooks", s.githubWebhook)
 		api.Group(func(worker chi.Router) {
 			worker.Use(s.workerAuth)
 			worker.Post("/worker/heartbeat", s.workerHeartbeat)
@@ -187,6 +282,7 @@ func (s *Server) routes() http.Handler {
 			worker.Get("/worker/orchestrate/sessions/{sessionId}/inspection", s.workerInspectSession)
 			worker.Post("/worker/blocker", s.workerReportBlocker)
 			worker.Post("/worker/scm/claim-pr", s.workerClaimOwnPullRequest)
+			worker.Post("/worker/github-token", s.workerGitHubToken)
 			worker.Handle("/git/{owner}/{repository}.git/*", http.HandlerFunc(s.gitProxy))
 		})
 
@@ -194,11 +290,23 @@ func (s *Server) routes() http.Handler {
 			protected.Use(s.auth.Middleware)
 			protected.Use(s.ensureAccount)
 			protected.Get("/me", s.me)
+			protected.Patch("/me", s.updateMe)
+			protected.Get("/orgs", s.listOrgs)
+			protected.Post("/orgs", s.createOrg)
+			protected.Get("/invitations", s.listMyInvitations)
+			protected.Post("/invitations/{invitationId}/accept", s.acceptInvitation)
+			protected.Post("/invitations/{invitationId}/decline", s.declineInvitation)
+			protected.Get("/shares", s.listSharedProjects)
+			protected.Post("/share-links/{token}/redeem", s.redeemProjectShareLink)
+			// Compatibility aliases for existing local tests/tools. The browser UI
+			// uses the explicit /orgs/{orgId}/... routes below.
 			protected.Get("/projects", s.listProjects)
 			protected.Post("/projects", s.createProject)
+			protected.Delete("/projects/{projectId}", s.deleteProject)
 			protected.Get("/sessions", s.listSessions)
 			protected.Post("/sessions", s.createSession)
 			protected.Get("/sessions/{sessionId}", s.getSession)
+			protected.Delete("/sessions/{sessionId}", s.deleteSession)
 			protected.Get("/sessions/{sessionId}/active-turn", s.activeTurn)
 			protected.Post("/sessions/{sessionId}/desired-state", s.setDesiredState)
 			protected.Get("/sessions/{sessionId}/chat-events", s.chatEvents)
@@ -218,6 +326,53 @@ func (s *Server) routes() http.Handler {
 			protected.Put("/provider-connections/agents/{agent}", s.putAgentConnection)
 			protected.Delete("/provider-connections/agents/{agent}", s.deleteAgentConnection)
 			protected.Get("/repositories", s.listRepositories)
+			protected.Route("/orgs/{orgId}", func(org chi.Router) {
+				org.Use(s.requireOrg)
+				org.Patch("/", s.updateOrg)
+				org.Get("/members", s.listOrgMembers)
+				org.With(s.requireOrgRole("admin")).Patch("/members/{userId}", s.updateOrgMemberRole)
+				org.Get("/invitations", s.listOrgInvitations)
+				org.Post("/invitations", s.createOrgInvitation)
+				org.Post("/invitations/{invitationId}/revoke", s.revokeInvitation)
+				org.Get("/projects", s.listProjects)
+				org.With(s.requireOrgRole("member")).Post("/projects", s.createProject)
+				org.With(s.requireOrgRole("admin")).Delete("/projects/{projectId}", s.deleteProject)
+				org.With(s.requireOrgRole("member")).Get("/projects/{projectId}/shares", s.listProjectShareAccess)
+				org.With(s.requireOrgRole("member")).Post("/projects/{projectId}/shares", s.createProjectShareLink)
+				org.With(s.requireOrgRole("member")).Patch("/projects/{projectId}/shares/grants/{grantId}", s.updateProjectShareGrant)
+				org.With(s.requireOrgRole("member")).Delete("/projects/{projectId}/shares/grants/{grantId}", s.revokeProjectShareGrant)
+				org.With(s.requireOrgRole("member")).Delete("/projects/{projectId}/shares/links/{linkId}", s.revokeProjectShareLink)
+				org.Get("/sessions", s.listSessions)
+				org.With(s.requireOrgRole("member")).Post("/sessions", s.createSession)
+				org.Get("/sessions/{sessionId}", s.getSession)
+				org.With(s.requireOrgRole("member")).Delete("/sessions/{sessionId}", s.deleteSession)
+				org.Get("/sessions/{sessionId}/active-turn", s.activeTurn)
+				org.With(s.requireOrgRole("member")).Post("/sessions/{sessionId}/desired-state", s.setDesiredState)
+				org.Get("/sessions/{sessionId}/chat-events", s.chatEvents)
+				org.With(s.requireOrgRole("member")).Post("/sessions/{sessionId}/messages", s.sendMessage)
+				org.With(s.requireOrgRole("member")).Post("/sessions/{sessionId}/interrupt", s.interruptSession)
+				org.Get("/sessions/{sessionId}/events", s.streamEvents)
+				org.Get("/sessions/{sessionId}/scm", s.sessionSCM)
+				org.Get("/sessions/{sessionId}/workspace/files", s.workspaceFiles)
+				org.Get("/sessions/{sessionId}/workspace/file", s.workspaceFile)
+				org.Get("/sessions/{sessionId}/workspace/diff", s.workspaceDiff)
+				org.With(s.requireOrgRole("member")).Post("/sessions/{sessionId}/workspace/preview", s.workspacePreview)
+				org.Post("/sessions/{sessionId}/workspace/preview-ticket", s.issueWorkspacePreview)
+				org.Post("/sessions/{sessionId}/workspace/file-preview-ticket", s.issueWorkspaceFilePreview)
+				org.Post("/sessions/{sessionId}/terminal-ticket", s.issueTerminalTicket)
+				org.Get("/provider-connections", s.listProviderConnections)
+				org.With(s.requireOrgRole("admin")).Patch("/provider-settings", s.updateProviderSettings)
+				org.With(s.requireOrgRole("admin")).Put("/provider-connections/daytona", s.putDaytonaConnection)
+				org.With(s.requireOrgRole("admin")).Put("/provider-connections/agents/{agent}", s.putAgentConnection)
+				org.With(s.requireOrgRole("admin")).Delete("/provider-connections/agents/{agent}", s.deleteAgentConnection)
+				org.Get("/repositories", s.listRepositories)
+				org.Get("/github", s.getGitHub)
+				org.With(s.requireOrgRole("admin")).Post("/github/install", s.createGitHubInstall)
+				org.With(s.requireOrgRole("admin")).Post("/github/install/pending", s.pendingGitHubInstall)
+				org.With(s.requireOrgRole("admin")).Post("/github/install/confirm", s.confirmGitHubInstall)
+				org.With(s.requireOrgRole("admin")).Post("/github/sync", s.syncGitHub)
+				org.With(s.requireOrgRole("admin")).Delete("/github/installations/{installationId}", s.deleteGitHubInstallation)
+			})
 		})
 	})
 	return router
@@ -239,10 +394,7 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 		if routeContext := chi.RouteContext(r.Context()); routeContext != nil {
 			route = routeContext.RoutePattern()
 		}
-		logPath := r.URL.Path
-		if strings.HasPrefix(logPath, "/api/cloud/v1/preview/") {
-			logPath = "/api/cloud/v1/preview/[redacted]"
-		}
+		logPath := redactedRequestLogPath(r.URL.Path)
 		s.log.Info("AO Cloud request completed",
 			"request_id", middleware.GetReqID(r.Context()),
 			"method", r.Method,
@@ -253,6 +405,16 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 			"duration_ms", time.Since(startedAt).Milliseconds(),
 		)
 	})
+}
+
+func redactedRequestLogPath(path string) string {
+	if strings.HasPrefix(path, "/api/cloud/v1/preview/") {
+		return "/api/cloud/v1/preview/[redacted]"
+	}
+	if strings.HasPrefix(path, "/api/cloud/v1/share-links/") {
+		return "/api/cloud/v1/share-links/[redacted]"
+	}
+	return path
 }
 
 func quietCloudRequest(path string) bool {
@@ -284,18 +446,66 @@ func (s *Server) ensureAccount(next http.Handler) http.Handler {
 			writeError(w, r, http.StatusUnauthorized, "AUTH_REQUIRED", "A valid AO Cloud login is required.")
 			return
 		}
-		account, err := s.store.EnsureAccount(r.Context(), principal.UserID, principal.DisplayName)
+		account, err := s.ensurePrincipalAccount(r.Context(), &principal)
+		if errors.Is(err, errExternalSignupDisabled) {
+			writeError(w, r, http.StatusForbidden, "INVITATION_REQUIRED", "AO Cloud access requires an existing account or organization invitation.")
+			return
+		}
 		if err != nil {
 			s.internalError(w, r, "ensure account", err)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), accountContextKey{}, account)))
+		ctx := cloudauth.ContextWithPrincipal(r.Context(), principal)
+		ctx = context.WithValue(ctx, accountContextKey{}, account)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func (s *Server) ensurePrincipalAccount(
+	ctx context.Context,
+	principal *cloudauth.Principal,
+) (clouddomain.Account, error) {
+	if principal.AuthProvider != "" && principal.AuthProvider != "local" {
+		createPersonalOrg := s.allowExternalSignup
+		if !s.allowExternalSignup {
+			canSignIn, err := s.store.ExternalAccountCanSignIn(
+				ctx,
+				principal.AuthProvider,
+				principal.ExternalUserID,
+				principal.Email,
+			)
+			if err != nil {
+				return clouddomain.Account{}, err
+			}
+			if !canSignIn {
+				return clouddomain.Account{}, errExternalSignupDisabled
+			}
+		}
+		account, err := s.store.EnsureExternalAccount(
+			ctx,
+			principal.AuthProvider,
+			principal.ExternalUserID,
+			principal.Email,
+			principal.DisplayName,
+			createPersonalOrg,
+		)
+		if err != nil {
+			return clouddomain.Account{}, err
+		}
+		principal.UserID = account.OwnerUserID
+		return account, nil
+	}
+	return s.store.EnsureAccount(ctx, principal.UserID, principal.DisplayName)
 }
 
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	principal, _ := cloudauth.PrincipalFromContext(r.Context())
 	account, _ := accountFromContext(r.Context())
+	organizations, err := s.store.ListUserOrganizations(r.Context(), principal.UserID)
+	if err != nil {
+		s.internalError(w, r, "list user organizations", err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"user": map[string]string{
 			"id":          principal.UserID,
@@ -303,8 +513,532 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 			"displayName": principal.DisplayName,
 		},
 		"account":         account,
+		"organizations":   organizations,
 		"sandboxProvider": s.sandboxProvider,
 	})
+}
+
+func (s *Server) updateMe(w http.ResponseWriter, r *http.Request) {
+	principal, _ := cloudauth.PrincipalFromContext(r.Context())
+	var input struct {
+		DisplayName string `json:"displayName"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	input.DisplayName = strings.TrimSpace(input.DisplayName)
+	if input.DisplayName == "" {
+		writeError(w, r, http.StatusBadRequest, "INVALID_PROFILE", "Display name is required.")
+		return
+	}
+	if len(input.DisplayName) > 120 {
+		writeError(w, r, http.StatusBadRequest, "INVALID_PROFILE", "Display name must be at most 120 characters.")
+		return
+	}
+	user, err := s.store.UpdateUserProfile(r.Context(), principal.UserID, cloudpostgres.UpdateUserProfileInput{
+		DisplayName: input.DisplayName,
+	})
+	if errors.Is(err, cloudpostgres.ErrInvalidUserProfile) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_PROFILE", "Display name is required.")
+		return
+	}
+	if errors.Is(err, cloudpostgres.ErrCloudUserNotFound) {
+		writeError(w, r, http.StatusNotFound, "USER_NOT_FOUND", "The current user does not exist.")
+		return
+	}
+	if err != nil {
+		s.internalError(w, r, "update user profile", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"user": user})
+}
+
+func (s *Server) listOrgs(w http.ResponseWriter, r *http.Request) {
+	principal, _ := cloudauth.PrincipalFromContext(r.Context())
+	organizations, err := s.store.ListUserOrganizations(r.Context(), principal.UserID)
+	if err != nil {
+		s.internalError(w, r, "list user organizations", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"organizations": organizations})
+}
+
+func (s *Server) createOrg(w http.ResponseWriter, r *http.Request) {
+	principal, _ := cloudauth.PrincipalFromContext(r.Context())
+	if !s.allowExternalSignup && principal.AuthProvider != "" && principal.AuthProvider != "local" {
+		writeError(w, r, http.StatusForbidden, "ORG_CREATION_DISABLED", "Organization creation is invite-only in this AO Cloud deployment.")
+		return
+	}
+	var input struct {
+		DisplayName string `json:"displayName"`
+		Kind        string `json:"kind"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	org, err := s.store.CreateOrganization(r.Context(), cloudpostgres.CreateOrganizationInput{
+		UserID:      principal.UserID,
+		DisplayName: input.DisplayName,
+		Kind:        input.Kind,
+	})
+	if errors.Is(err, cloudpostgres.ErrInvalidOrganization) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_ORG", "Organization name is required.")
+		return
+	}
+	if err != nil {
+		s.internalError(w, r, "create organization", err)
+		return
+	}
+	if org.Organization.Kind != "personal" {
+		if _, err := s.store.SetOrgProviderSettings(r.Context(), org.Organization.ID, "personal_default"); err != nil {
+			s.internalError(w, r, "set organization provider defaults", err)
+			return
+		}
+		if err := s.syncPersonalDefaultAgentConnections(
+			r.Context(),
+			principal.UserID,
+			org.Organization.ID,
+		); err != nil {
+			s.internalError(w, r, "sync organization provider defaults", err)
+			return
+		}
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"organization": org})
+}
+
+func (s *Server) updateOrg(w http.ResponseWriter, r *http.Request) {
+	org, _ := orgFromContext(r.Context())
+	if !orgRoleAtLeast(org.Membership.Role, "admin") {
+		writeError(w, r, http.StatusForbidden, "ORG_ROLE_REQUIRED", "Only organization admins can update organization settings.")
+		return
+	}
+	var input struct {
+		DisplayName string `json:"displayName"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	updated, err := s.store.UpdateOrganization(r.Context(), org.Organization.ID, cloudpostgres.UpdateOrganizationInput{
+		DisplayName: input.DisplayName,
+	})
+	if errors.Is(err, cloudpostgres.ErrInvalidOrganization) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_ORG", "Organization name is required.")
+		return
+	}
+	if errors.Is(err, cloudpostgres.ErrOrganizationNotFound) {
+		writeError(w, r, http.StatusNotFound, "ORG_NOT_FOUND", "The organization does not exist.")
+		return
+	}
+	if err != nil {
+		s.internalError(w, r, "update organization", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"organization": updated})
+}
+
+func (s *Server) listOrgMembers(w http.ResponseWriter, r *http.Request) {
+	org, _ := orgFromContext(r.Context())
+	members, err := s.store.ListOrgMembers(r.Context(), org.Organization.ID)
+	if err != nil {
+		s.internalError(w, r, "list org members", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"members": members})
+}
+
+func (s *Server) updateOrgMemberRole(w http.ResponseWriter, r *http.Request) {
+	org, _ := orgFromContext(r.Context())
+	principal, _ := cloudauth.PrincipalFromContext(r.Context())
+	targetUserID := strings.TrimSpace(chi.URLParam(r, "userId"))
+	if targetUserID == "" {
+		writeError(w, r, http.StatusBadRequest, "INVALID_MEMBER", "Member user id is required.")
+		return
+	}
+	var input struct {
+		Role string `json:"role"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	input.Role = strings.TrimSpace(input.Role)
+	if !validOrgRole(input.Role) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_ROLE", "Role must be owner, admin, member, or viewer.")
+		return
+	}
+	if input.Role == "owner" && org.Membership.Role != "owner" {
+		writeError(w, r, http.StatusForbidden, "ORG_ROLE_REQUIRED", "Only organization owners can grant owner role.")
+		return
+	}
+	members, err := s.store.ListOrgMembers(r.Context(), org.Organization.ID)
+	if err != nil {
+		s.internalError(w, r, "list org members for role update", err)
+		return
+	}
+	var target clouddomain.OrgMember
+	ownerCount := 0
+	targetFound := false
+	for _, member := range members {
+		if member.Membership.Role == "owner" {
+			ownerCount++
+		}
+		if string(member.User.ID) == targetUserID {
+			target = member
+			targetFound = true
+		}
+	}
+	if !targetFound {
+		writeError(w, r, http.StatusNotFound, "MEMBER_NOT_FOUND", "The organization member does not exist.")
+		return
+	}
+	if status, code, message, ok := validateOrgMemberRoleUpdate(
+		principal.UserID,
+		org.Membership.Role,
+		target,
+		ownerCount,
+		input.Role,
+	); !ok {
+		writeError(w, r, status, code, message)
+		return
+	}
+	member, err := s.store.UpdateOrgMemberRole(r.Context(), org.Organization.ID, targetUserID, input.Role)
+	if errors.Is(err, cloudpostgres.ErrOrgMembershipNotFound) {
+		writeError(w, r, http.StatusNotFound, "MEMBER_NOT_FOUND", "The organization member does not exist.")
+		return
+	}
+	if err != nil {
+		s.internalError(w, r, "update org member role", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"member": member})
+}
+
+func validateOrgMemberRoleUpdate(
+	principalUserID string,
+	actorRole string,
+	target clouddomain.OrgMember,
+	ownerCount int,
+	nextRole string,
+) (int, string, string, bool) {
+	if string(target.User.ID) == principalUserID {
+		return http.StatusForbidden, "ORG_ROLE_REQUIRED", "You cannot change your own organization role.", false
+	}
+	if target.Membership.Role == "owner" && actorRole != "owner" {
+		return http.StatusForbidden, "ORG_ROLE_REQUIRED", "Only organization owners can change another owner's role.", false
+	}
+	if target.Membership.Role == "owner" && nextRole != "owner" && ownerCount <= 1 {
+		return http.StatusConflict, "LAST_OWNER_REQUIRED", "An organization must keep at least one owner.", false
+	}
+	return 0, "", "", true
+}
+
+func (s *Server) listMyInvitations(w http.ResponseWriter, r *http.Request) {
+	principal, _ := cloudauth.PrincipalFromContext(r.Context())
+	invitations, err := s.store.ListUserInvitations(r.Context(), principal.UserID, principal.Email)
+	if err != nil {
+		s.internalError(w, r, "list user invitations", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"invitations": invitations})
+}
+
+func (s *Server) listOrgInvitations(w http.ResponseWriter, r *http.Request) {
+	org, _ := orgFromContext(r.Context())
+	if !orgRoleAtLeast(org.Membership.Role, "admin") {
+		writeError(w, r, http.StatusForbidden, "ORG_ROLE_REQUIRED", "Only organization admins can view invitations.")
+		return
+	}
+	invitations, err := s.store.ListOrgInvitations(r.Context(), org.Organization.ID)
+	if err != nil {
+		s.internalError(w, r, "list org invitations", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"invitations": invitations})
+}
+
+func (s *Server) createOrgInvitation(w http.ResponseWriter, r *http.Request) {
+	org, _ := orgFromContext(r.Context())
+	if !orgRoleAtLeast(org.Membership.Role, "admin") {
+		writeError(w, r, http.StatusForbidden, "ORG_ROLE_REQUIRED", "Only organization admins can invite people.")
+		return
+	}
+	principal, _ := cloudauth.PrincipalFromContext(r.Context())
+	var input struct {
+		Email string `json:"email"`
+		Role  string `json:"role"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	email, err := normalizeCloudEmail(input.Email)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_EMAIL", "A valid invite email is required.")
+		return
+	}
+	role := strings.TrimSpace(input.Role)
+	if role == "" {
+		role = "member"
+	}
+	if !validOrgRole(role) || role == "owner" {
+		writeError(w, r, http.StatusBadRequest, "INVALID_ROLE", "Invite role must be admin, member, or viewer.")
+		return
+	}
+	invitation, err := s.store.CreateOrgInvitation(
+		r.Context(),
+		org.Organization.ID,
+		cloudpostgres.CreateOrgInvitationInput{
+			Email:           email,
+			InvitedByUserID: clouddomain.UserID(principal.UserID),
+			Role:            role,
+		},
+	)
+	if errors.Is(err, cloudpostgres.ErrOrgInvitationExists) {
+		writeError(w, r, http.StatusConflict, "INVITATION_EXISTS", "This email already has a pending invitation.")
+		return
+	}
+	if err != nil {
+		s.internalError(w, r, "create org invitation", err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"invitation": invitation})
+}
+
+func (s *Server) acceptInvitation(w http.ResponseWriter, r *http.Request) {
+	principal, _ := cloudauth.PrincipalFromContext(r.Context())
+	membership, err := s.store.AcceptOrgInvitation(
+		r.Context(),
+		principal.UserID,
+		principal.Email,
+		chi.URLParam(r, "invitationId"),
+	)
+	if errors.Is(err, cloudpostgres.ErrOrgInvitationNotFound) {
+		writeError(w, r, http.StatusNotFound, "INVITATION_NOT_FOUND", "The invitation is no longer available.")
+		return
+	}
+	if err != nil {
+		s.internalError(w, r, "accept org invitation", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"membership": membership})
+}
+
+func (s *Server) declineInvitation(w http.ResponseWriter, r *http.Request) {
+	principal, _ := cloudauth.PrincipalFromContext(r.Context())
+	err := s.store.DeclineOrgInvitation(
+		r.Context(),
+		principal.UserID,
+		principal.Email,
+		chi.URLParam(r, "invitationId"),
+	)
+	if errors.Is(err, cloudpostgres.ErrOrgInvitationNotFound) {
+		writeError(w, r, http.StatusNotFound, "INVITATION_NOT_FOUND", "The invitation is no longer available.")
+		return
+	}
+	if err != nil {
+		s.internalError(w, r, "decline org invitation", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) revokeInvitation(w http.ResponseWriter, r *http.Request) {
+	org, _ := orgFromContext(r.Context())
+	if !orgRoleAtLeast(org.Membership.Role, "admin") {
+		writeError(w, r, http.StatusForbidden, "ORG_ROLE_REQUIRED", "Only organization admins can revoke invitations.")
+		return
+	}
+	err := s.store.RevokeOrgInvitation(r.Context(), org.Organization.ID, chi.URLParam(r, "invitationId"))
+	if errors.Is(err, cloudpostgres.ErrOrgInvitationNotFound) {
+		writeError(w, r, http.StatusNotFound, "INVITATION_NOT_FOUND", "The invitation is no longer available.")
+		return
+	}
+	if err != nil {
+		s.internalError(w, r, "revoke org invitation", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) requireOrg(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		principal, ok := cloudauth.PrincipalFromContext(r.Context())
+		if !ok {
+			writeError(w, r, http.StatusUnauthorized, "AUTH_REQUIRED", "A valid AO Cloud login is required.")
+			return
+		}
+		orgID := clouddomain.OrgID(strings.TrimSpace(chi.URLParam(r, "orgId")))
+		if orgID == "" {
+			writeError(w, r, http.StatusBadRequest, "ORG_REQUIRED", "An organization is required.")
+			return
+		}
+		org, err := s.store.GetOrgMembership(r.Context(), principal.UserID, orgID)
+		if errors.Is(err, cloudpostgres.ErrOrgMembershipNotFound) {
+			shared, sharedOK, sharedErr := s.sharedAccessForOrg(r.Context(), principal.UserID, orgID)
+			if sharedErr != nil {
+				s.internalError(w, r, "authorize shared organization", sharedErr)
+				return
+			}
+			if !sharedOK {
+				writeError(w, r, http.StatusForbidden, "ORG_FORBIDDEN", "You do not have access to this organization.")
+				return
+			}
+			if !sharedProjectRequestAllowed(r, orgID) {
+				writeError(w, r, http.StatusForbidden, "PROJECT_SHARE_SCOPE_REQUIRED", "This share grants access only to its project and sessions.")
+				return
+			}
+			org = clouddomain.UserOrganization{
+				Organization: clouddomain.Organization{
+					ID:          orgID,
+					DisplayName: "Shared",
+					Kind:        "shared",
+					Status:      "active",
+				},
+				Membership: clouddomain.OrgMembership{
+					OrgID:  orgID,
+					UserID: clouddomain.UserID(principal.UserID),
+					Role:   "viewer",
+					Status: "active",
+				},
+			}
+			account := clouddomain.Account{
+				ID:          clouddomain.AccountID(org.Organization.ID),
+				OwnerUserID: principal.UserID,
+				DisplayName: org.Organization.DisplayName,
+				CreatedAt:   org.Organization.CreatedAt,
+				UpdatedAt:   org.Organization.UpdatedAt,
+			}
+			ctx := context.WithValue(r.Context(), orgContextKey{}, org)
+			ctx = context.WithValue(ctx, accountContextKey{}, account)
+			ctx = context.WithValue(ctx, sharedProjectAccessContextKey{}, shared)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+		if err != nil {
+			s.internalError(w, r, "authorize organization", err)
+			return
+		}
+		account := clouddomain.Account{
+			ID:          clouddomain.AccountID(org.Organization.ID),
+			OwnerUserID: principal.UserID,
+			DisplayName: org.Organization.DisplayName,
+			CreatedAt:   org.Organization.CreatedAt,
+			UpdatedAt:   org.Organization.UpdatedAt,
+		}
+		ctx := context.WithValue(r.Context(), orgContextKey{}, org)
+		ctx = context.WithValue(ctx, accountContextKey{}, account)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func sharedProjectRequestAllowed(r *http.Request, orgID clouddomain.OrgID) bool {
+	prefix := "/api/cloud/v1/orgs/" + string(orgID)
+	path := strings.TrimPrefix(r.URL.Path, prefix)
+	if path == r.URL.Path {
+		return false
+	}
+	switch path {
+	case "/projects":
+		return r.Method == http.MethodGet
+	case "/sessions":
+		return r.Method == http.MethodGet || r.Method == http.MethodPost
+	default:
+		return strings.HasPrefix(path, "/sessions/")
+	}
+}
+
+func (s *Server) sharedAccessForOrg(
+	ctx context.Context,
+	userID string,
+	orgID clouddomain.OrgID,
+) (sharedProjectAccess, bool, error) {
+	grants, err := s.store.ListSharedProjectGrants(ctx, userID)
+	if err != nil {
+		return sharedProjectAccess{}, false, err
+	}
+	access := sharedProjectAccess{
+		ProjectIDs: map[clouddomain.ProjectID]struct{}{},
+		Roles:      map[clouddomain.ProjectID]string{},
+	}
+	for _, grant := range grants {
+		if grant.OrgID != orgID {
+			continue
+		}
+		access.ProjectIDs[grant.Project.ID] = struct{}{}
+		access.Roles[grant.Project.ID] = grant.Role
+	}
+	return access, len(access.ProjectIDs) > 0, nil
+}
+
+func (s *Server) requireOrgRole(required string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if shared, ok := sharedProjectAccessFromContext(r.Context()); ok {
+				if required != "member" {
+					writeError(w, r, http.StatusForbidden, "ORG_ROLE_REQUIRED", "A project share does not grant organization administration access.")
+					return
+				}
+				sessionID := clouddomain.SessionID(strings.TrimSpace(chi.URLParam(r, "sessionId")))
+				if sessionID == "" {
+					next.ServeHTTP(w, r)
+					return
+				}
+				account, _ := accountFromContext(r.Context())
+				session, err := s.store.GetSession(r.Context(), account.ID, sessionID)
+				if err != nil || shared.Roles[session.ProjectID] != "editor" {
+					writeError(w, r, http.StatusForbidden, "ORG_ROLE_REQUIRED", "Viewer access is read-only for this project.")
+					return
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+			org, ok := orgFromContext(r.Context())
+			if !ok || !orgRoleAtLeast(org.Membership.Role, required) {
+				writeError(w, r, http.StatusForbidden, "ORG_ROLE_REQUIRED", "Your organization role cannot perform this action.")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func normalizeCloudEmail(value string) (string, error) {
+	email := strings.ToLower(strings.TrimSpace(value))
+	parsed, err := mail.ParseAddress(email)
+	if err != nil || parsed.Address != email {
+		return "", errors.New("invalid email")
+	}
+	return email, nil
+}
+
+func validOrgRole(role string) bool {
+	switch role {
+	case "owner", "admin", "member", "viewer":
+		return true
+	default:
+		return false
+	}
+}
+
+func validProjectShareRole(role string) bool {
+	return role == "viewer" || role == "editor"
+}
+
+func orgRoleAtLeast(actual, required string) bool {
+	return orgRoleRank(actual) >= orgRoleRank(required)
+}
+
+func orgRoleRank(role string) int {
+	switch role {
+	case "owner":
+		return 3
+	case "admin":
+		return 2
+	case "member", "editor":
+		return 1
+	case "viewer":
+		return 0
+	default:
+		return -1
+	}
 }
 
 func (s *Server) localSignUp(w http.ResponseWriter, r *http.Request) {
@@ -374,12 +1108,17 @@ func writeLocalAuthResponse(w http.ResponseWriter, status int, principal cloudau
 }
 
 func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
+	if _, shared := sharedProjectAccessFromContext(r.Context()); shared {
+		writeError(w, r, http.StatusForbidden, "PROJECT_FORBIDDEN", "A project share does not grant permission to create other projects.")
+		return
+	}
 	account, _ := accountFromContext(r.Context())
 	var input struct {
-		DisplayName   string          `json:"displayName"`
-		RepositoryURL string          `json:"repositoryUrl"`
-		DefaultBranch string          `json:"defaultBranch"`
-		Config        json.RawMessage `json:"config"`
+		DisplayName        string          `json:"displayName"`
+		RepositoryURL      string          `json:"repositoryUrl"`
+		DefaultBranch      string          `json:"defaultBranch"`
+		GitHubRepositoryID *int64          `json:"githubRepositoryId"`
+		Config             json.RawMessage `json:"config"`
 	}
 	if !decodeJSON(w, r, &input) {
 		return
@@ -387,7 +1126,37 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 	input.DisplayName = strings.TrimSpace(input.DisplayName)
 	input.RepositoryURL = strings.TrimSpace(input.RepositoryURL)
 	input.DefaultBranch = strings.TrimSpace(input.DefaultBranch)
-	if input.DisplayName == "" || !validGitHubRepositoryURL(input.RepositoryURL) {
+	if input.DisplayName == "" {
+		writeError(w, r, http.StatusBadRequest, "INVALID_PROJECT", "A project name is required.")
+		return
+	}
+	if s.githubMode() == "github-app" {
+		if input.GitHubRepositoryID == nil || *input.GitHubRepositoryID <= 0 || s.githubStore == nil {
+			writeError(w, r, http.StatusBadRequest, "INVALID_PROJECT", "An authorized GitHub repository is required.")
+			return
+		}
+		repositories, err := s.githubStore.ListActiveGitHubRepositories(
+			r.Context(),
+			clouddomain.OrgID(account.ID),
+		)
+		if err != nil {
+			s.internalError(w, r, "load authorized GitHub repository", err)
+			return
+		}
+		var selected *clouddomain.GitHubGrantedRepository
+		for index := range repositories {
+			if repositories[index].Repository.ID == *input.GitHubRepositoryID {
+				selected = &repositories[index]
+				break
+			}
+		}
+		if selected == nil {
+			writeError(w, r, http.StatusForbidden, "REPOSITORY_NOT_AUTHORIZED", "The GitHub repository is not authorized for this organization.")
+			return
+		}
+		input.RepositoryURL = selected.Repository.HTMLURL
+		input.DefaultBranch = selected.Repository.DefaultBranch
+	} else if !validGitHubRepositoryURL(input.RepositoryURL) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_PROJECT", "A name and HTTPS GitHub repository URL are required.")
 		return
 	}
@@ -410,10 +1179,11 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	project, err := s.store.CreateProject(r.Context(), account.ID, cloudpostgres.CreateProjectInput{
-		DisplayName:   input.DisplayName,
-		RepositoryURL: input.RepositoryURL,
-		DefaultBranch: input.DefaultBranch,
-		Config:        input.Config,
+		DisplayName:        input.DisplayName,
+		RepositoryURL:      input.RepositoryURL,
+		DefaultBranch:      input.DefaultBranch,
+		GitHubRepositoryID: input.GitHubRepositoryID,
+		Config:             input.Config,
 	})
 	if errors.Is(err, cloudpostgres.ErrProjectExists) {
 		writeError(w, r, http.StatusConflict, "PROJECT_EXISTS", "This repository is already registered.")
@@ -426,12 +1196,249 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"project": project})
 }
 
+func (s *Server) createProjectShareLink(w http.ResponseWriter, r *http.Request) {
+	if _, shared := sharedProjectAccessFromContext(r.Context()); shared {
+		writeError(w, r, http.StatusForbidden, "PROJECT_SHARE_FORBIDDEN", "Shared project access cannot be reshared.")
+		return
+	}
+	account, _ := accountFromContext(r.Context())
+	org, _ := orgFromContext(r.Context())
+	principal, _ := cloudauth.PrincipalFromContext(r.Context())
+	projectID := clouddomain.ProjectID(strings.TrimSpace(chi.URLParam(r, "projectId")))
+	if projectID == "" {
+		writeError(w, r, http.StatusBadRequest, "PROJECT_REQUIRED", "A project is required.")
+		return
+	}
+	var input struct {
+		SessionID       clouddomain.SessionID `json:"sessionId"`
+		Role            string                `json:"role"`
+		AccessScope     string                `json:"accessScope"`
+		RecipientEmails []string              `json:"recipientEmails"`
+		RecipientOrgIDs []clouddomain.OrgID   `json:"recipientOrgIds"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	role := strings.TrimSpace(input.Role)
+	if role == "" {
+		role = "viewer"
+	}
+	if !validProjectShareRole(role) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_SHARE_ROLE", "Share role must be viewer or editor.")
+		return
+	}
+	accessScope := strings.TrimSpace(input.AccessScope)
+	if accessScope == "" {
+		accessScope = "anyone"
+	}
+	if accessScope != "anyone" && accessScope != "restricted" {
+		writeError(w, r, http.StatusBadRequest, "INVALID_SHARE_SCOPE", "Share access must be anyone or restricted.")
+		return
+	}
+	if accessScope == "restricted" && len(input.RecipientEmails) == 0 && len(input.RecipientOrgIDs) == 0 {
+		writeError(w, r, http.StatusBadRequest, "SHARE_RECIPIENT_REQUIRED", "Restricted links require at least one email or organization.")
+		return
+	}
+	if len(input.RecipientOrgIDs) > 0 {
+		organizations, err := s.store.ListUserOrganizations(r.Context(), principal.UserID)
+		if err != nil {
+			s.internalError(w, r, "validate share recipient organizations", err)
+			return
+		}
+		allowed := map[clouddomain.OrgID]struct{}{}
+		for _, organization := range organizations {
+			allowed[organization.Organization.ID] = struct{}{}
+		}
+		for _, orgID := range input.RecipientOrgIDs {
+			if _, ok := allowed[orgID]; !ok {
+				writeError(w, r, http.StatusForbidden, "SHARE_ORG_FORBIDDEN", "You can only restrict links to organizations you belong to.")
+				return
+			}
+		}
+	}
+	if _, err := s.store.GetProject(r.Context(), account.ID, projectID); errors.Is(err, cloudpostgres.ErrProjectNotFound) {
+		writeError(w, r, http.StatusNotFound, "PROJECT_NOT_FOUND", "The cloud project does not exist.")
+		return
+	} else if err != nil {
+		s.internalError(w, r, "load share project", err)
+		return
+	}
+	if input.SessionID != "" {
+		session, err := s.store.GetSession(r.Context(), account.ID, input.SessionID)
+		if errors.Is(err, cloudpostgres.ErrSessionNotFound) {
+			writeError(w, r, http.StatusNotFound, "SESSION_NOT_FOUND", "The cloud session does not exist in this project.")
+			return
+		}
+		if err != nil {
+			s.internalError(w, r, "load share session", err)
+			return
+		}
+		if session.ProjectID != projectID {
+			writeError(w, r, http.StatusNotFound, "SESSION_NOT_FOUND", "The cloud session does not exist in this project.")
+			return
+		}
+	}
+	token, err := newShareToken()
+	if err != nil {
+		s.internalError(w, r, "generate share token", err)
+		return
+	}
+	link, err := s.store.CreateProjectShareLink(r.Context(), cloudpostgres.CreateProjectShareLinkInput{
+		OrgID:           org.Organization.ID,
+		ProjectID:       projectID,
+		SessionID:       input.SessionID,
+		CreatedByUserID: clouddomain.UserID(principal.UserID),
+		Role:            role,
+		Token:           token,
+		AccessScope:     accessScope,
+		RecipientEmails: input.RecipientEmails,
+		RecipientOrgIDs: input.RecipientOrgIDs,
+	})
+	if errors.Is(err, cloudpostgres.ErrProjectShareInvalidRecipient) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_SHARE_RECIPIENT", "Enter valid email recipients.")
+		return
+	}
+	if err != nil {
+		s.internalError(w, r, "create project share link", err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"shareLink": link, "token": token})
+}
+
+func (s *Server) listProjectShareAccess(w http.ResponseWriter, r *http.Request) {
+	org, _ := orgFromContext(r.Context())
+	projectID := clouddomain.ProjectID(strings.TrimSpace(chi.URLParam(r, "projectId")))
+	if projectID == "" {
+		writeError(w, r, http.StatusBadRequest, "PROJECT_REQUIRED", "A project is required.")
+		return
+	}
+	access, err := s.store.ListProjectShareAccess(r.Context(), org.Organization.ID, projectID)
+	if err != nil {
+		s.internalError(w, r, "list project share access", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"access": access})
+}
+
+func (s *Server) updateProjectShareGrant(w http.ResponseWriter, r *http.Request) {
+	org, _ := orgFromContext(r.Context())
+	projectID := clouddomain.ProjectID(strings.TrimSpace(chi.URLParam(r, "projectId")))
+	grantID := strings.TrimSpace(chi.URLParam(r, "grantId"))
+	var input struct {
+		Role string `json:"role"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	role := strings.TrimSpace(input.Role)
+	if !validProjectShareRole(role) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_SHARE_ROLE", "Share role must be viewer or editor.")
+		return
+	}
+	grant, err := s.store.UpdateProjectShareGrantRole(r.Context(), org.Organization.ID, projectID, grantID, role)
+	if errors.Is(err, cloudpostgres.ErrProjectShareGrantNotFound) {
+		writeError(w, r, http.StatusNotFound, "SHARE_GRANT_NOT_FOUND", "That shared access no longer exists.")
+		return
+	}
+	if err != nil {
+		s.internalError(w, r, "update project share grant", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"grant": grant})
+}
+
+func (s *Server) revokeProjectShareGrant(w http.ResponseWriter, r *http.Request) {
+	org, _ := orgFromContext(r.Context())
+	projectID := clouddomain.ProjectID(strings.TrimSpace(chi.URLParam(r, "projectId")))
+	grantID := strings.TrimSpace(chi.URLParam(r, "grantId"))
+	err := s.store.RevokeProjectShareGrant(r.Context(), org.Organization.ID, projectID, grantID)
+	if errors.Is(err, cloudpostgres.ErrProjectShareGrantNotFound) {
+		writeError(w, r, http.StatusNotFound, "SHARE_GRANT_NOT_FOUND", "That shared access no longer exists.")
+		return
+	}
+	if err != nil {
+		s.internalError(w, r, "revoke project share grant", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) revokeProjectShareLink(w http.ResponseWriter, r *http.Request) {
+	org, _ := orgFromContext(r.Context())
+	projectID := clouddomain.ProjectID(strings.TrimSpace(chi.URLParam(r, "projectId")))
+	linkID := strings.TrimSpace(chi.URLParam(r, "linkId"))
+	err := s.store.RevokeProjectShareLink(r.Context(), org.Organization.ID, projectID, linkID)
+	if errors.Is(err, cloudpostgres.ErrProjectShareLinkNotFound) {
+		writeError(w, r, http.StatusNotFound, "SHARE_LINK_NOT_FOUND", "That share link no longer exists.")
+		return
+	}
+	if err != nil {
+		s.internalError(w, r, "revoke project share link", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) redeemProjectShareLink(w http.ResponseWriter, r *http.Request) {
+	principal, _ := cloudauth.PrincipalFromContext(r.Context())
+	token := strings.TrimSpace(chi.URLParam(r, "token"))
+	if token == "" {
+		writeError(w, r, http.StatusBadRequest, "SHARE_TOKEN_REQUIRED", "A share token is required.")
+		return
+	}
+	grant, err := s.store.RedeemProjectShareLink(r.Context(), token, principal.UserID)
+	if errors.Is(err, cloudpostgres.ErrProjectShareLinkNotFound) {
+		writeError(w, r, http.StatusNotFound, "SHARE_LINK_NOT_FOUND", "This share link is no longer available.")
+		return
+	}
+	if errors.Is(err, cloudpostgres.ErrProjectShareSelfRedeem) {
+		writeError(w, r, http.StatusBadRequest, "SHARE_SELF_REDEEM", "You already own this shared project.")
+		return
+	}
+	if errors.Is(err, cloudpostgres.ErrProjectShareUnauthorized) {
+		writeError(w, r, http.StatusForbidden, "SHARE_RECIPIENT_REQUIRED", "This share link is not available for your account.")
+		return
+	}
+	if err != nil {
+		s.internalError(w, r, "redeem project share link", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"share": grant})
+}
+
+func (s *Server) listSharedProjects(w http.ResponseWriter, r *http.Request) {
+	principal, _ := cloudauth.PrincipalFromContext(r.Context())
+	grants, err := s.store.ListSharedProjectGrants(r.Context(), principal.UserID)
+	if err != nil {
+		s.internalError(w, r, "list shared projects", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"shares": grants})
+}
+
+func newShareToken() (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw[:]), nil
+}
+
 func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 	account, _ := accountFromContext(r.Context())
 	projects, err := s.store.ListProjects(r.Context(), account.ID)
 	if err != nil {
 		s.internalError(w, r, "list projects", err)
 		return
+	}
+	if shared, ok := sharedProjectAccessFromContext(r.Context()); ok {
+		filtered := projects[:0]
+		for _, project := range projects {
+			if _, allowed := shared.ProjectIDs[project.ID]; allowed {
+				filtered = append(filtered, project)
+			}
+		}
+		projects = filtered
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"projects": projects})
 }
@@ -472,6 +1479,16 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_SESSION", "projectId and displayName are required.")
 		return
 	}
+	if shared, ok := sharedProjectAccessFromContext(r.Context()); ok {
+		if _, allowed := shared.ProjectIDs[input.ProjectID]; !allowed {
+			writeError(w, r, http.StatusForbidden, "PROJECT_FORBIDDEN", "This shared link does not grant access to that project.")
+			return
+		}
+		if shared.Roles[input.ProjectID] != "editor" {
+			writeError(w, r, http.StatusForbidden, "ORG_ROLE_REQUIRED", "Viewer access is read-only for this project.")
+			return
+		}
+	}
 	defaultResource := clouddomain.DefaultResourceProfile()
 	if input.Resource == (clouddomain.ResourceProfile{}) {
 		input.Resource = defaultResource
@@ -505,16 +1522,17 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		credential.Secret = ""
 	}
 	result, err := s.store.CreateSession(r.Context(), account.ID, cloudpostgres.CreateSessionInput{
-		IdempotencyKey:       idempotencyKey,
-		ProjectID:            input.ProjectID,
-		Kind:                 input.Kind,
-		Harness:              input.Harness,
-		DisplayName:          input.DisplayName,
-		Branch:               strings.TrimSpace(input.Branch),
-		Prompt:               input.Prompt,
-		Resource:             input.Resource,
-		Provider:             s.sandboxProvider,
-		ProviderConnectionID: providerConnectionID(s.sandboxProvider, input.ProviderConnectionID),
+		IdempotencyKey:           idempotencyKey,
+		ProjectID:                input.ProjectID,
+		Kind:                     input.Kind,
+		Harness:                  input.Harness,
+		DisplayName:              input.DisplayName,
+		Branch:                   strings.TrimSpace(input.Branch),
+		Prompt:                   input.Prompt,
+		Resource:                 input.Resource,
+		Provider:                 s.sandboxProvider,
+		ProviderConnectionID:     providerConnectionID(s.sandboxProvider, input.ProviderConnectionID),
+		MaxActiveSandboxesPerOrg: s.maxActiveSandboxesPerOrg,
 	})
 	if errors.Is(err, cloudpostgres.ErrIdempotencyConflict) {
 		writeError(w, r, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used for another command.")
@@ -530,6 +1548,19 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if errors.Is(err, cloudpostgres.ErrActiveOrchestrator) {
 		writeError(w, r, http.StatusConflict, "ORCHESTRATOR_EXISTS", "This project already has an active orchestrator.")
+		return
+	}
+	if errors.Is(err, cloudpostgres.ErrSandboxQuotaExceeded) {
+		writeError(
+			w,
+			r,
+			http.StatusConflict,
+			"SANDBOX_QUOTA_EXCEEDED",
+			fmt.Sprintf(
+				"This organization already has %d active sandboxes. Delete a worker machine to make room before starting another one.",
+				s.maxActiveSandboxesPerOrg,
+			),
+		)
 		return
 	}
 	if err != nil {
@@ -557,6 +1588,15 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, "list sessions", err)
 		return
 	}
+	if shared, ok := sharedProjectAccessFromContext(r.Context()); ok {
+		filtered := sessions[:0]
+		for _, session := range sessions {
+			if _, allowed := shared.ProjectIDs[session.ProjectID]; allowed {
+				filtered = append(filtered, session)
+			}
+		}
+		sessions = filtered
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
 }
 
@@ -575,6 +1615,12 @@ func (s *Server) getSession(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, "get session", err)
 		return
 	}
+	if shared, ok := sharedProjectAccessFromContext(r.Context()); ok {
+		if _, allowed := shared.ProjectIDs[session.ProjectID]; !allowed {
+			writeError(w, r, http.StatusNotFound, "SESSION_NOT_FOUND", "The cloud session does not exist.")
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"session": session})
 }
 
@@ -587,14 +1633,8 @@ func (s *Server) activeTurn(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) chatEvents(w http.ResponseWriter, r *http.Request) {
-	account, _ := accountFromContext(r.Context())
-	sessionID := clouddomain.SessionID(chi.URLParam(r, "sessionId"))
-	if _, err := s.store.GetSession(r.Context(), account.ID, sessionID); err != nil {
-		if errors.Is(err, cloudpostgres.ErrSessionNotFound) {
-			writeError(w, r, http.StatusNotFound, "SESSION_NOT_FOUND", "The cloud session does not exist.")
-			return
-		}
-		s.internalError(w, r, "authorize chat event replay", err)
+	account, session, ok := s.authorizedSession(w, r, "authorize chat event replay")
+	if !ok {
 		return
 	}
 	after, err := parseAfter(r)
@@ -607,7 +1647,7 @@ func (s *Server) chatEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_LIMIT", "limit must be a positive integer no greater than 500.")
 		return
 	}
-	events, err := s.events.ReplayChat(r.Context(), account.ID, sessionID, after, limit)
+	events, err := s.events.ReplayChat(r.Context(), account.ID, session.ID, after, limit)
 	if err != nil {
 		s.internalError(w, r, "replay chat events", err)
 		return
@@ -616,14 +1656,8 @@ func (s *Server) chatEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
-	account, _ := accountFromContext(r.Context())
-	sessionID := clouddomain.SessionID(chi.URLParam(r, "sessionId"))
-	if _, err := s.store.GetSession(r.Context(), account.ID, sessionID); err != nil {
-		if errors.Is(err, cloudpostgres.ErrSessionNotFound) {
-			writeError(w, r, http.StatusNotFound, "SESSION_NOT_FOUND", "The cloud session does not exist.")
-			return
-		}
-		s.internalError(w, r, "authorize cloud message", err)
+	account, session, ok := s.authorizedSession(w, r, "authorize cloud message")
+	if !ok {
 		return
 	}
 	idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
@@ -644,7 +1678,7 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 	event, err := s.events.AppendUserMessage(
 		r.Context(),
 		account.ID,
-		sessionID,
+		session.ID,
 		idempotencyKey,
 		input.Text,
 	)
@@ -660,7 +1694,7 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, "append cloud message", err)
 		return
 	}
-	if err := s.wakeSessionForMessage(r.Context(), account.ID, sessionID); err != nil {
+	if err := s.wakeSessionForMessage(r.Context(), account.ID, session.ID); err != nil {
 		s.internalError(w, r, "wake cloud session for message", err)
 		return
 	}
@@ -669,13 +1703,13 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 		Data:     base64.StdEncoding.EncodeToString([]byte(input.Text)),
 		Sequence: event.Sequence,
 	}
-	if err := s.workerHub.Send(sessionID, command); err != nil {
+	if err := s.workerHub.Send(session.ID, command); err != nil {
 		writeError(w, r, http.StatusServiceUnavailable, "WORKER_BACKPRESSURE", "The message was saved but worker delivery is temporarily unavailable.")
 		return
 	}
 	s.log.Info("cloud turn queued",
 		"request_id", middleware.GetReqID(r.Context()),
-		"session_id", sessionID,
+		"session_id", session.ID,
 		"message_sequence", event.Sequence,
 	)
 	writeJSON(w, http.StatusAccepted, map[string]any{"event": event})
@@ -716,6 +1750,7 @@ func (s *Server) wakeSessionForMessage(
 
 func (s *Server) interruptSession(w http.ResponseWriter, r *http.Request) {
 	account, _ := accountFromContext(r.Context())
+	account.ID = tenantAccountIDFromContext(r.Context())
 	sessionID := clouddomain.SessionID(chi.URLParam(r, "sessionId"))
 	session, err := s.store.GetSession(r.Context(), account.ID, sessionID)
 	if err != nil {
@@ -797,6 +1832,7 @@ func (s *Server) authorizedSession(
 	action string,
 ) (clouddomain.Account, clouddomain.Session, bool) {
 	account, _ := accountFromContext(r.Context())
+	account.ID = tenantAccountIDFromContext(r.Context())
 	session, err := s.store.GetSession(
 		r.Context(),
 		account.ID,
@@ -809,6 +1845,12 @@ func (s *Server) authorizedSession(
 	if err != nil {
 		s.internalError(w, r, action, err)
 		return clouddomain.Account{}, clouddomain.Session{}, false
+	}
+	if shared, ok := sharedProjectAccessFromContext(r.Context()); ok {
+		if _, allowed := shared.ProjectIDs[session.ProjectID]; !allowed {
+			writeError(w, r, http.StatusNotFound, "SESSION_NOT_FOUND", "The cloud session does not exist.")
+			return clouddomain.Account{}, clouddomain.Session{}, false
+		}
 	}
 	return account, session, true
 }
@@ -867,17 +1909,106 @@ func (s *Server) setDesiredState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "state": input.State})
 }
 
-func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
-	account, _ := accountFromContext(r.Context())
-	sessionID := clouddomain.SessionID(chi.URLParam(r, "sessionId"))
-	if _, err := s.store.GetSession(r.Context(), account.ID, sessionID); err != nil {
+func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
+	account, session, ok := s.authorizedSession(w, r, "delete cloud session")
+	if !ok {
+		return
+	}
+	if session.Kind != "worker" {
+		writeError(w, r, http.StatusConflict, "PROJECT_DELETE_REQUIRED", "Remove the project to delete its orchestrator.")
+		return
+	}
+	if err := s.deleteSessionSandbox(r.Context(), account.ID, session.ID); err != nil {
+		s.internalError(w, r, "delete session sandbox", err)
+		return
+	}
+	if err := s.store.DeleteSession(r.Context(), account.ID, session.ID); err != nil {
 		if errors.Is(err, cloudpostgres.ErrSessionNotFound) {
 			writeError(w, r, http.StatusNotFound, "SESSION_NOT_FOUND", "The cloud session does not exist.")
 			return
 		}
-		s.internalError(w, r, "authorize event stream", err)
+		s.internalError(w, r, "delete cloud session", err)
 		return
 	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request) {
+	account, _ := accountFromContext(r.Context())
+	account.ID = tenantAccountIDFromContext(r.Context())
+	projectID := clouddomain.ProjectID(chi.URLParam(r, "projectId"))
+	if projectID == "" {
+		writeError(w, r, http.StatusBadRequest, "PROJECT_ID_REQUIRED", "projectId is required.")
+		return
+	}
+	if _, err := s.store.GetProject(r.Context(), account.ID, projectID); err != nil {
+		if errors.Is(err, cloudpostgres.ErrProjectNotFound) {
+			writeError(w, r, http.StatusNotFound, "PROJECT_NOT_FOUND", "The cloud project does not exist.")
+			return
+		}
+		s.internalError(w, r, "load project for deletion", err)
+		return
+	}
+	sessions, err := s.store.ListSessions(r.Context(), account.ID)
+	if err != nil {
+		s.internalError(w, r, "list project sessions for deletion", err)
+		return
+	}
+	for _, session := range sessions {
+		if session.ProjectID != projectID {
+			continue
+		}
+		if err := s.deleteSessionSandbox(r.Context(), account.ID, session.ID); err != nil {
+			s.internalError(w, r, "delete project session sandbox", err)
+			return
+		}
+	}
+	if err := s.store.DeleteProject(r.Context(), account.ID, projectID); err != nil {
+		if errors.Is(err, cloudpostgres.ErrProjectNotFound) {
+			writeError(w, r, http.StatusNotFound, "PROJECT_NOT_FOUND", "The cloud project does not exist.")
+			return
+		}
+		s.internalError(w, r, "delete cloud project", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) deleteSessionSandbox(
+	ctx context.Context,
+	accountID clouddomain.AccountID,
+	sessionID clouddomain.SessionID,
+) error {
+	sandbox, err := s.store.GetSandbox(ctx, accountID, sessionID)
+	if errors.Is(err, cloudpostgres.ErrSessionNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if sandbox.ProviderEnvironmentID == "" {
+		return nil
+	}
+	if s.sandboxProviders == nil {
+		return errors.New("sandbox provider resolver is not configured")
+	}
+	provider, err := s.sandboxProviders.Resolve(ctx, sandbox)
+	if err != nil {
+		return err
+	}
+	if err := provider.Delete(ctx, cloudsandbox.ID(sandbox.ProviderEnvironmentID)); err != nil &&
+		!errors.Is(err, cloudsandbox.ErrNotFound) {
+		return err
+	}
+	return nil
+}
+
+func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
+	account, session, ok := s.authorizedSession(w, r, "authorize event stream")
+	if !ok {
+		return
+	}
+	sessionID := session.ID
 	after, err := parseAfter(r)
 	if err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_AFTER", "after must be a non-negative integer.")
@@ -1001,7 +2132,7 @@ func (s *Server) workerBootstrap(w http.ResponseWriter, r *http.Request) {
 		defer func() { agentCredential.Secret = "" }()
 	}
 	localGitHubToken := ""
-	if s.sandboxProvider == "docker" && s.localGitHub != nil {
+	if includeLocalGitHubToken(s.sandboxProvider, s.githubMode(), s.localGitHub != nil) {
 		localGitHubToken, err = s.localGitHub.Token(r.Context())
 		if err != nil {
 			s.internalError(w, r, "load local GitHub credential for worker", err)
@@ -1057,18 +2188,31 @@ func (s *Server) workerBootstrap(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func includeLocalGitHubToken(sandboxProvider, githubMode string, githubConfigured bool) bool {
+	return sandboxProvider == "docker" && githubMode == "local-gh" && githubConfigured
+}
+
 type workerContextKey struct{}
 
 func (s *Server) workerAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		scheme, token, ok := strings.Cut(strings.TrimSpace(r.Header.Get("Authorization")), " ")
-		if !ok || !strings.EqualFold(scheme, "Worker") {
-			writeError(w, r, http.StatusUnauthorized, "WORKER_AUTH_REQUIRED", "A valid worker credential is required.")
+		switch {
+		case ok && strings.EqualFold(scheme, "Worker"):
+		case ok && strings.EqualFold(scheme, "Basic") && isWorkerGitProxyRequest(r):
+			username, password, basicOK := r.BasicAuth()
+			if !basicOK || username != cloudworker.GitProxyUsername {
+				writeWorkerAuthError(w, r, "INVALID_WORKER_TOKEN", "Worker credential is invalid or expired.")
+				return
+			}
+			token = password
+		default:
+			writeWorkerAuthError(w, r, "WORKER_AUTH_REQUIRED", "A valid worker credential is required.")
 			return
 		}
 		claims, err := s.workerTokens.Verify(token)
 		if err != nil {
-			writeError(w, r, http.StatusUnauthorized, "INVALID_WORKER_TOKEN", "Worker credential is invalid or expired.")
+			writeWorkerAuthError(w, r, "INVALID_WORKER_TOKEN", "Worker credential is invalid or expired.")
 			return
 		}
 		current, err := s.store.WorkerConnectionCurrent(
@@ -1083,11 +2227,37 @@ func (s *Server) workerAuth(next http.Handler) http.Handler {
 			return
 		}
 		if !current {
-			writeError(w, r, http.StatusUnauthorized, "STALE_WORKER_TOKEN", "Worker credential has been replaced.")
+			writeWorkerAuthError(w, r, "STALE_WORKER_TOKEN", "Worker credential has been replaced.")
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), workerContextKey{}, claims)))
 	})
+}
+
+func writeWorkerAuthError(w http.ResponseWriter, r *http.Request, code, message string) {
+	if isWorkerGitProxyRequest(r) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="ao-worker-git"`)
+	}
+	writeError(w, r, http.StatusUnauthorized, code, message)
+}
+
+func isWorkerGitProxyRequest(r *http.Request) bool {
+	const prefix = "/api/cloud/v1/git/"
+	path := strings.TrimPrefix(r.URL.Path, prefix)
+	if path == r.URL.Path {
+		return false
+	}
+	parts := strings.Split(path, "/")
+	if len(parts) < 3 ||
+		parts[0] == "" ||
+		parts[0] == "." ||
+		parts[0] == ".." ||
+		!strings.HasSuffix(parts[1], ".git") ||
+		strings.TrimSuffix(parts[1], ".git") == "" {
+		return false
+	}
+	_, err := cloudlocalgh.GitOperation(r.Method, strings.Join(parts[2:], "/"), r.URL.Query())
+	return err == nil
 }
 
 func workerFromContext(ctx context.Context) cloudworker.Claims {
@@ -1163,7 +2333,17 @@ func (s *Server) workerCreateSession(w http.ResponseWriter, r *http.Request) {
 			s.internalError(w, r, "load orchestrator project for issue", err)
 			return
 		}
-		resolved, err := s.localGitHub.GetIssue(r.Context(), project.RepositoryURL, input.IssueNumber)
+		githubCtx, ok := s.githubOperationContext(
+			w,
+			r,
+			project,
+			cloudlocalgh.OperationIssueRead,
+			"authorize GitHub issue lookup",
+		)
+		if !ok {
+			return
+		}
+		resolved, err := s.localGitHub.GetIssue(githubCtx, project.RepositoryURL, input.IssueNumber)
 		if err != nil {
 			writeError(w, r, http.StatusBadRequest, "INVALID_ISSUE", "The GitHub issue could not be found in this project.")
 			return
@@ -1210,15 +2390,16 @@ func (s *Server) workerCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, err := s.store.CreateSession(r.Context(), claims.AccountID, cloudpostgres.CreateSessionInput{
-		IdempotencyKey:       idempotencyKey,
-		ProjectID:            parent.ProjectID,
-		Kind:                 "worker",
-		Harness:              input.Harness,
-		DisplayName:          input.DisplayName,
-		Prompt:               input.Prompt,
-		Resource:             parentSandbox.ResourceProfile,
-		Provider:             parentSandbox.Provider,
-		ProviderConnectionID: parentSandbox.ProviderConnectionID,
+		IdempotencyKey:           idempotencyKey,
+		ProjectID:                parent.ProjectID,
+		Kind:                     "worker",
+		Harness:                  input.Harness,
+		DisplayName:              input.DisplayName,
+		Prompt:                   input.Prompt,
+		Resource:                 parentSandbox.ResourceProfile,
+		Provider:                 parentSandbox.Provider,
+		ProviderConnectionID:     parentSandbox.ProviderConnectionID,
+		MaxActiveSandboxesPerOrg: s.maxActiveSandboxesPerOrg,
 	})
 	if errors.Is(err, cloudpostgres.ErrIdempotencyConflict) {
 		writeError(w, r, http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used for another command.")
@@ -1226,6 +2407,19 @@ func (s *Server) workerCreateSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if errors.Is(err, cloudpostgres.ErrProviderConnectionNotFound) {
 		writeError(w, r, http.StatusBadRequest, "PROVIDER_CONNECTION_NOT_FOUND", "The orchestrator sandbox provider connection is unavailable.")
+		return
+	}
+	if errors.Is(err, cloudpostgres.ErrSandboxQuotaExceeded) {
+		writeError(
+			w,
+			r,
+			http.StatusConflict,
+			"SANDBOX_QUOTA_EXCEEDED",
+			fmt.Sprintf(
+				"This organization already has %d active sandboxes. Delete a worker machine to make room before starting another one.",
+				s.maxActiveSandboxesPerOrg,
+			),
+		)
 		return
 	}
 	if err != nil {
@@ -1321,7 +2515,17 @@ func (s *Server) workerClaimPullRequest(w http.ResponseWriter, r *http.Request) 
 		s.internalError(w, r, "load project for pull request claim", err)
 		return
 	}
-	pull, err := s.localGitHub.GetPullRequest(r.Context(), project.RepositoryURL, input.Reference)
+	githubCtx, ok := s.githubOperationContext(
+		w,
+		r,
+		project,
+		cloudlocalgh.OperationPullRequestRead,
+		"authorize GitHub pull request lookup",
+	)
+	if !ok {
+		return
+	}
+	pull, err := s.localGitHub.GetPullRequest(githubCtx, project.RepositoryURL, input.Reference)
 	if err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_PULL_REQUEST", "The pull request must belong to this project.")
 		return
@@ -1345,6 +2549,7 @@ func (s *Server) workerClaimPullRequest(w http.ResponseWriter, r *http.Request) 
 		s.internalError(w, r, "claim pull request", err)
 		return
 	}
+	s.refreshClaimedPullRequest(r.Context(), project)
 	writeJSON(w, http.StatusOK, map[string]any{"claim": claim})
 }
 
@@ -1371,7 +2576,17 @@ func (s *Server) workerMergePullRequest(w http.ResponseWriter, r *http.Request) 
 		s.internalError(w, r, "load project for pull request merge", err)
 		return
 	}
-	pull, err := s.localGitHub.MergePullRequest(r.Context(), project.RepositoryURL, scm.PullRequest.Number)
+	githubCtx, ok := s.githubOperationContext(
+		w,
+		r,
+		project,
+		cloudlocalgh.OperationMerge,
+		"authorize GitHub pull request merge",
+	)
+	if !ok {
+		return
+	}
+	pull, err := s.localGitHub.MergePullRequest(githubCtx, project.RepositoryURL, scm.PullRequest.Number)
 	if err != nil {
 		writeError(w, r, http.StatusBadGateway, "PULL_REQUEST_MERGE_FAILED", err.Error())
 		return
@@ -1390,7 +2605,7 @@ func (s *Server) workerMergePullRequest(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) workerResolveReviewThread(w http.ResponseWriter, r *http.Request) {
-	claims, _, target, ok := s.authorizedProjectWorker(w, r, "authorize review thread resolution")
+	claims, parent, target, ok := s.authorizedProjectWorker(w, r, "authorize review thread resolution")
 	if !ok {
 		return
 	}
@@ -1412,7 +2627,22 @@ func (s *Server) workerResolveReviewThread(w http.ResponseWriter, r *http.Reques
 		writeError(w, r, http.StatusNotFound, "REVIEW_THREAD_NOT_FOUND", "The review thread does not belong to this worker.")
 		return
 	}
-	if err := s.localGitHub.ResolveReviewThread(r.Context(), threadID); err != nil {
+	project, err := s.store.GetProject(r.Context(), claims.AccountID, parent.ProjectID)
+	if err != nil {
+		s.internalError(w, r, "load project for review thread resolution", err)
+		return
+	}
+	githubCtx, ok := s.githubOperationContext(
+		w,
+		r,
+		project,
+		cloudlocalgh.OperationResolveReviewThread,
+		"authorize GitHub review thread resolution",
+	)
+	if !ok {
+		return
+	}
+	if err := s.localGitHub.ResolveReviewThread(githubCtx, threadID); err != nil {
 		writeError(w, r, http.StatusBadGateway, "REVIEW_THREAD_RESOLVE_FAILED", err.Error())
 		return
 	}
@@ -1719,7 +2949,17 @@ func (s *Server) workerClaimOwnPullRequest(w http.ResponseWriter, r *http.Reques
 		s.internalError(w, r, "load project for worker pull request claim", err)
 		return
 	}
-	pull, err := s.localGitHub.GetPullRequest(r.Context(), project.RepositoryURL, input.Reference)
+	githubCtx, ok := s.githubOperationContext(
+		w,
+		r,
+		project,
+		cloudlocalgh.OperationPullRequestRead,
+		"authorize GitHub pull request lookup",
+	)
+	if !ok {
+		return
+	}
+	pull, err := s.localGitHub.GetPullRequest(githubCtx, project.RepositoryURL, input.Reference)
 	if err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_PULL_REQUEST", "The pull request must belong to this project.")
 		return
@@ -1739,6 +2979,7 @@ func (s *Server) workerClaimOwnPullRequest(w http.ResponseWriter, r *http.Reques
 		s.internalError(w, r, "claim worker pull request", err)
 		return
 	}
+	s.refreshClaimedPullRequest(r.Context(), project)
 	payload, _ := json.Marshal(map[string]any{
 		"repository": pull.Repository,
 		"number":     pull.Number,
@@ -1750,6 +2991,72 @@ func (s *Server) workerClaimOwnPullRequest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"claim": claim})
+}
+
+func (s *Server) refreshClaimedPullRequest(ctx context.Context, project clouddomain.Project) {
+	if s.githubApp == nil ||
+		s.githubApp.repositoryRefresh == nil ||
+		project.GitHubRepositoryID == nil {
+		return
+	}
+	if err := s.githubApp.repositoryRefresh(ctx, project.OrgID, *project.GitHubRepositoryID); err != nil {
+		s.log.Warn("claimed pull request refresh failed",
+			"org_id", project.OrgID,
+			"project_id", project.ID,
+			"github_repository_id", *project.GitHubRepositoryID,
+			"err", err,
+		)
+	}
+}
+
+func (s *Server) workerGitHubToken(w http.ResponseWriter, r *http.Request) {
+	claims := workerFromContext(r.Context())
+	if !cloudworker.HasScope(claims, "worker:git") {
+		writeError(w, r, http.StatusForbidden, "SCOPE_REQUIRED", "worker:git scope is required.")
+		return
+	}
+	if strings.TrimSpace(r.Header.Get("X-AO-Session-ID")) != string(claims.SessionID) {
+		writeError(w, r, http.StatusForbidden, "SESSION_ID_MISMATCH", "Worker session identity does not match its credential.")
+		return
+	}
+	if s.localGitHub == nil {
+		writeError(w, r, http.StatusNotImplemented, "GITHUB_CONNECTION_REQUIRED", "GitHub is not configured for this deployment.")
+		return
+	}
+	session, err := s.store.GetSession(r.Context(), claims.AccountID, claims.SessionID)
+	if errors.Is(err, cloudpostgres.ErrSessionNotFound) {
+		writeError(w, r, http.StatusNotFound, "SESSION_NOT_FOUND", "The cloud session does not exist.")
+		return
+	}
+	if err != nil {
+		s.internalError(w, r, "authorize worker GitHub token", err)
+		return
+	}
+	if session.IsTerminated {
+		writeError(w, r, http.StatusForbidden, "WORKER_REQUIRED", "Only an active worker can request a GitHub token.")
+		return
+	}
+	project, err := s.store.GetProject(r.Context(), claims.AccountID, session.ProjectID)
+	if err != nil {
+		s.internalError(w, r, "load project for worker GitHub token", err)
+		return
+	}
+	githubCtx, ok := s.githubOperationContext(
+		w,
+		r,
+		project,
+		cloudlocalgh.OperationPullRequestWrite,
+		"authorize worker GitHub token",
+	)
+	if !ok {
+		return
+	}
+	token, err := s.localGitHub.Token(githubCtx)
+	if err != nil {
+		s.internalError(w, r, "mint worker GitHub token", err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"token": token})
 }
 
 func (s *Server) projectOrchestrator(
@@ -1861,6 +3168,16 @@ func (s *Server) workerEvent(w http.ResponseWriter, r *http.Request) {
 			s.internalError(w, r, "claim durable chat turn", err)
 			return
 		}
+		if _, err := s.store.TransitionActiveTurn(
+			r.Context(),
+			claims.AccountID,
+			claims.SessionID,
+			"running",
+			"",
+		); err != nil {
+			s.internalError(w, r, "start acknowledged chat turn", err)
+			return
+		}
 	}
 	if input.Type == "agent.activity" {
 		var activity struct {
@@ -1911,6 +3228,13 @@ func (s *Server) workerEvent(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if activityStartsTurn(activity.Event, activity.State) {
+				if err := s.acknowledgeCommandPrompt(
+					r.Context(),
+					claims,
+				); err != nil {
+					s.internalError(w, r, "acknowledge command-delivered prompt", err)
+					return
+				}
 				if _, err := s.store.TransitionActiveTurn(
 					r.Context(),
 					claims.AccountID,
@@ -2066,6 +3390,60 @@ func (s *Server) workerEvent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"event": event})
 }
 
+func (s *Server) acknowledgeCommandPrompt(
+	ctx context.Context,
+	claims cloudworker.Claims,
+) error {
+	activeTurn, err := s.store.GetActiveTurn(ctx, claims.AccountID, claims.SessionID)
+	if err != nil || activeTurn == nil {
+		return err
+	}
+	if err := s.store.ClaimActiveTurn(
+		ctx,
+		claims.AccountID,
+		claims.SessionID,
+		activeTurn.UserMessageSequence,
+		claims.Epoch,
+	); err != nil {
+		return err
+	}
+	accepted, err := s.store.LatestPromptAcceptedSequence(
+		ctx,
+		claims.AccountID,
+		claims.SessionID,
+	)
+	if err != nil {
+		return err
+	}
+	if activeTurn.UserMessageSequence <= accepted {
+		return nil
+	}
+	payload, err := json.Marshal(map[string]int64{
+		"sequence": activeTurn.UserMessageSequence,
+	})
+	if err != nil {
+		return err
+	}
+	event, err := s.events.Append(
+		ctx,
+		claims.AccountID,
+		claims.SessionID,
+		"worker.prompt_accepted",
+		payload,
+	)
+	if err != nil {
+		return err
+	}
+	s.log.Info("cloud command-delivered prompt accepted",
+		"session_id", claims.SessionID,
+		"worker_id", claims.WorkerID,
+		"worker_epoch", claims.Epoch,
+		"prompt_sequence", activeTurn.UserMessageSequence,
+		"event_sequence", event.Sequence,
+	)
+	return nil
+}
+
 func activityStartsTurn(event, state string) bool {
 	return event == "user-prompt-submit" && state == "active"
 }
@@ -2197,6 +3575,17 @@ func (s *Server) workerConnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_AFTER", "after must be a non-negative integer.")
 		return
 	}
+	commandPromptSequence, err := parseCommandPromptSequence(r)
+	if err != nil || commandPromptSequence > after {
+		writeError(
+			w,
+			r,
+			http.StatusBadRequest,
+			"INVALID_COMMAND_PROMPT",
+			"commandPrompt must be a non-negative sequence at or before after.",
+		)
+		return
+	}
 	socket, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		CompressionMode: websocket.CompressionDisabled,
 	})
@@ -2243,7 +3632,9 @@ func (s *Server) workerConnect(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	if retrySequence > 0 && retrySequence <= replayedAfter {
+	if retrySequence > 0 &&
+		retrySequence <= replayedAfter &&
+		retrySequence != commandPromptSequence {
 		replayedAfter = retrySequence - 1
 	}
 	if err := s.writePromptReplay(r.Context(), socket, claims, &replayedAfter); err != nil {
@@ -2362,14 +3753,8 @@ func (s *Server) writeWorkerSocket(
 }
 
 func (s *Server) issueTerminalTicket(w http.ResponseWriter, r *http.Request) {
-	account, _ := accountFromContext(r.Context())
-	sessionID := clouddomain.SessionID(chi.URLParam(r, "sessionId"))
-	if _, err := s.store.GetSession(r.Context(), account.ID, sessionID); err != nil {
-		if errors.Is(err, cloudpostgres.ErrSessionNotFound) {
-			writeError(w, r, http.StatusNotFound, "SESSION_NOT_FOUND", "The cloud session does not exist.")
-			return
-		}
-		s.internalError(w, r, "authorize terminal ticket", err)
+	account, session, ok := s.authorizedSession(w, r, "authorize terminal ticket")
+	if !ok {
 		return
 	}
 	var input struct {
@@ -2383,12 +3768,22 @@ func (s *Server) issueTerminalTicket(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "INVALID_TERMINAL_KIND", "terminal kind must be agent or workspace.")
 		return
 	}
+	scopes := []string{"terminal:read"}
+	canOperate := false
+	if shared, ok := sharedProjectAccessFromContext(r.Context()); ok {
+		canOperate = shared.Roles[session.ProjectID] == "editor"
+	} else if org, ok := orgFromContext(r.Context()); !ok || orgRoleAtLeast(org.Membership.Role, "member") {
+		canOperate = true
+	}
+	if canOperate {
+		scopes = append(scopes, "terminal:operate")
+	}
 	ticket, err := s.store.IssueAccessTicket(
 		r.Context(),
 		account.ID,
-		sessionID,
+		session.ID,
 		terminalTicketPurpose(kind),
-		[]string{"terminal:read", "terminal:operate"},
+		scopes,
 		60*time.Second,
 	)
 	if err != nil {
@@ -2398,6 +3793,7 @@ func (s *Server) issueTerminalTicket(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"ticket":    ticket,
 		"expiresIn": 60,
+		"scopes":    scopes,
 	})
 }
 
@@ -2440,6 +3836,15 @@ func terminalOutputEvent(kind string) string {
 	return "terminal.output"
 }
 
+func ticketHasScope(scopes []string, expected string) bool {
+	for _, scope := range scopes {
+		if scope == expected {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) terminalSocket(w http.ResponseWriter, r *http.Request) {
 	kind := terminalKind(r.URL.Query().Get("kind"))
 	if kind == "" {
@@ -2459,6 +3864,7 @@ func (s *Server) terminalSocket(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, "consume terminal ticket", err)
 		return
 	}
+	canOperateTerminal := ticketHasScope(ticket.Scopes, "terminal:operate")
 	after, err := parseAfter(r)
 	if err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_AFTER", "after must be a non-negative integer.")
@@ -2524,6 +3930,12 @@ func (s *Server) terminalSocket(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	if err := writeTerminalMessage(ctx, socket, terminalServerMessage{
+		Type:     "replay_complete",
+		Sequence: sent,
+	}); err != nil {
+		return
+	}
 
 	clientCommands := make(chan terminalClientCommand, 64)
 	readErrors := make(chan error, 1)
@@ -2579,6 +3991,13 @@ func (s *Server) terminalSocket(w http.ResponseWriter, r *http.Request) {
 				})
 				continue
 			}
+			if !terminalCommandAllowed(canOperateTerminal, workerCommand) {
+				_ = writeTerminalMessage(ctx, socket, terminalServerMessage{
+					Type:    "error",
+					Message: "Terminal is read-only for viewers.",
+				})
+				continue
+			}
 			if kind == "workspace" {
 				workerCommand.Type = "workspace_terminal_" + workerCommand.Type
 			}
@@ -2594,6 +4013,10 @@ func (s *Server) terminalSocket(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+func terminalCommandAllowed(canOperate bool, command cloudworkerhub.Command) bool {
+	return canOperate || command.Type == "resize"
 }
 
 func validateTerminalCommand(command terminalClientCommand) (cloudworkerhub.Command, error) {
@@ -2659,7 +4082,15 @@ func (s *Server) listProviderConnections(w http.ResponseWriter, r *http.Request)
 		s.internalError(w, r, "list provider connections", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"providerConnections": connections})
+	settings, err := s.store.OrgProviderSettings(r.Context(), clouddomain.OrgID(account.ID))
+	if err != nil {
+		s.internalError(w, r, "load provider settings", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"providerConnections":  connections,
+		"agentCredentialsMode": settings.AgentCredentialsMode,
+	})
 }
 
 const maxAgentCredentialBytes = 64 << 10
@@ -2670,6 +4101,7 @@ type agentConnectionConfig struct {
 
 func (s *Server) putAgentConnection(w http.ResponseWriter, r *http.Request) {
 	account, _ := accountFromContext(r.Context())
+	principal, _ := cloudauth.PrincipalFromContext(r.Context())
 	agent := strings.TrimSpace(chi.URLParam(r, "agent"))
 	if _, ok := agentCredentialTypes[agent]; !ok {
 		writeError(w, r, http.StatusBadRequest, "INVALID_AGENT", "The selected coding agent is not supported.")
@@ -2737,7 +4169,71 @@ func (s *Server) putAgentConnection(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, "save agent connection", err)
 		return
 	}
+	if org, ok := orgFromContext(r.Context()); ok {
+		if org.Organization.Kind == "personal" {
+			if err := s.syncDefaultAgentConnectionToOwnedOrgs(
+				r.Context(),
+				principal.UserID,
+				agent,
+				secret,
+				config,
+			); err != nil {
+				s.internalError(w, r, "sync personal provider defaults", err)
+				return
+			}
+		} else if org.Membership.Role == "owner" || org.Membership.Role == "admin" {
+			if _, err := s.store.SetOrgProviderSettings(r.Context(), org.Organization.ID, "custom"); err != nil {
+				s.internalError(w, r, "set custom provider mode", err)
+				return
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"providerConnection": connection})
+}
+
+func (s *Server) updateProviderSettings(w http.ResponseWriter, r *http.Request) {
+	org, _ := orgFromContext(r.Context())
+	principal, _ := cloudauth.PrincipalFromContext(r.Context())
+	var input struct {
+		AgentCredentialsMode string `json:"agentCredentialsMode"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	mode := strings.TrimSpace(input.AgentCredentialsMode)
+	if org.Organization.Kind == "personal" && mode != "custom" {
+		writeError(w, r, http.StatusBadRequest, "INVALID_PROVIDER_SETTINGS", "Personal workspaces always use their own provider credentials.")
+		return
+	}
+	settings, err := s.store.SetOrgProviderSettings(r.Context(), org.Organization.ID, mode)
+	if errors.Is(err, cloudpostgres.ErrInvalidProviderSettings) {
+		writeError(w, r, http.StatusBadRequest, "INVALID_PROVIDER_SETTINGS", "agentCredentialsMode must be custom or personal_default.")
+		return
+	}
+	if err != nil {
+		s.internalError(w, r, "save provider settings", err)
+		return
+	}
+	if mode == "personal_default" {
+		if err := s.syncPersonalDefaultAgentConnections(
+			r.Context(),
+			principal.UserID,
+			org.Organization.ID,
+		); err != nil {
+			s.internalError(w, r, "sync provider defaults", err)
+			return
+		}
+	}
+	connections, err := s.store.ListProviderConnections(r.Context(), clouddomain.AccountID(org.Organization.ID))
+	if err != nil {
+		s.internalError(w, r, "list provider connections", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"providerSettings":     settings,
+		"providerConnections":  connections,
+		"agentCredentialsMode": settings.AgentCredentialsMode,
+	})
 }
 
 func (s *Server) deleteAgentConnection(w http.ResponseWriter, r *http.Request) {
@@ -2839,6 +4335,105 @@ func (s *Server) loadAgentCredential(
 	return credential, nil
 }
 
+func (s *Server) syncPersonalDefaultAgentConnections(
+	ctx context.Context,
+	userID string,
+	targetOrgID clouddomain.OrgID,
+) error {
+	personalOrgID, err := s.store.PersonalOrgIDForUser(ctx, userID)
+	if errors.Is(err, cloudpostgres.ErrOrganizationNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if personalOrgID == targetOrgID {
+		return nil
+	}
+	connections, err := s.store.ListProviderConnections(ctx, clouddomain.AccountID(personalOrgID))
+	if err != nil {
+		return err
+	}
+	for _, connection := range connections {
+		if connection.Label != "default" || connection.ValidationState != "valid" {
+			continue
+		}
+		if _, ok := agentCredentialTypes[connection.Provider]; !ok {
+			continue
+		}
+		encrypted, nonce, config, err := s.store.ProviderConnectionSecretByProvider(
+			ctx,
+			clouddomain.AccountID(personalOrgID),
+			connection.Provider,
+			"default",
+		)
+		if errors.Is(err, cloudpostgres.ErrProviderConnectionNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		plaintext, err := s.secretCipher.Decrypt(
+			encrypted,
+			nonce,
+			string(personalOrgID)+":"+connection.Provider+":default",
+		)
+		if err != nil {
+			clearBytes(plaintext)
+			return err
+		}
+		if err := s.upsertAgentSecretForOrg(ctx, targetOrgID, connection.Provider, plaintext, config); err != nil {
+			clearBytes(plaintext)
+			return err
+		}
+		clearBytes(plaintext)
+	}
+	return nil
+}
+
+func (s *Server) syncDefaultAgentConnectionToOwnedOrgs(
+	ctx context.Context,
+	userID string,
+	agent string,
+	secret []byte,
+	config json.RawMessage,
+) error {
+	orgIDs, err := s.store.ListDefaultProviderOrgsForUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	for _, orgID := range orgIDs {
+		if err := s.upsertAgentSecretForOrg(ctx, orgID, agent, secret, config); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) upsertAgentSecretForOrg(
+	ctx context.Context,
+	orgID clouddomain.OrgID,
+	agent string,
+	secret []byte,
+	config json.RawMessage,
+) error {
+	associatedData := string(orgID) + ":" + agent + ":default"
+	encrypted, nonce, err := s.secretCipher.Encrypt(secret, associatedData)
+	if err != nil {
+		return err
+	}
+	_, err = s.store.UpsertProviderConnection(
+		ctx,
+		clouddomain.AccountID(orgID),
+		agent,
+		"default",
+		encrypted,
+		nonce,
+		config,
+	)
+	return err
+}
+
 func clearBytes(value []byte) {
 	for index := range value {
 		value[index] = 0
@@ -2846,8 +4441,33 @@ func clearBytes(value []byte) {
 }
 
 var errAgentConnectionRequired = errors.New("coding-agent connection required")
+var errExternalSignupDisabled = errors.New("external account signup is disabled")
 
 func (s *Server) listRepositories(w http.ResponseWriter, r *http.Request) {
+	if s.githubApp != nil && s.githubApp.mode == "github-app" {
+		org, ok := orgFromContext(r.Context())
+		if !ok || s.githubStore == nil {
+			writeError(w, r, http.StatusNotImplemented, "GITHUB_CONNECTION_REQUIRED", "GitHub is not configured for this deployment.")
+			return
+		}
+		repositories, err := s.githubStore.ListActiveGitHubRepositories(r.Context(), org.Organization.ID)
+		if err != nil {
+			s.internalError(w, r, "list GitHub App repositories", err)
+			return
+		}
+		response := make([]map[string]any, 0, len(repositories))
+		for _, repository := range repositories {
+			response = append(response, map[string]any{
+				"id":            repository.Repository.ID,
+				"fullName":      repository.Repository.FullName,
+				"url":           repository.Repository.HTMLURL,
+				"defaultBranch": repository.Repository.DefaultBranch,
+				"private":       repository.Repository.Private,
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"repositories": response})
+		return
+	}
 	if s.localGitHub == nil {
 		writeError(w, r, http.StatusNotImplemented, "GITHUB_CONNECTION_REQUIRED", "GitHub is not configured for this deployment.")
 		return
@@ -2860,6 +4480,46 @@ func (s *Server) listRepositories(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"repositories": repositories})
 }
 
+func (s *Server) githubOperationContext(
+	w http.ResponseWriter,
+	r *http.Request,
+	project clouddomain.Project,
+	operation cloudlocalgh.CredentialOperation,
+	action string,
+) (context.Context, bool) {
+	if s.githubMode() != "github-app" {
+		return r.Context(), true
+	}
+	if project.GitHubRepositoryID == nil || s.githubStore == nil {
+		writeError(w, r, http.StatusForbidden, "REPOSITORY_NOT_AUTHORIZED", "This project is not linked to an authorized GitHub repository.")
+		return nil, false
+	}
+	_, err := s.githubStore.FindActiveGitHubRepositoryGrant(
+		r.Context(),
+		project.OrgID,
+		*project.GitHubRepositoryID,
+	)
+	if errors.Is(err, cloudpostgres.ErrGitHubRepositoryGrantNotFound) {
+		writeError(w, r, http.StatusForbidden, "REPOSITORY_NOT_AUTHORIZED", "This project's GitHub repository grant is no longer active.")
+		return nil, false
+	}
+	if err != nil {
+		s.internalError(w, r, action, err)
+		return nil, false
+	}
+	scoped, err := cloudlocalgh.ContextWithCredentialScope(
+		r.Context(),
+		project.OrgID,
+		*project.GitHubRepositoryID,
+		operation,
+	)
+	if err != nil {
+		s.internalError(w, r, action, err)
+		return nil, false
+	}
+	return scoped, true
+}
+
 func (s *Server) gitProxy(w http.ResponseWriter, r *http.Request) {
 	claims := workerFromContext(r.Context())
 	if !cloudworker.HasScope(claims, "worker:git") {
@@ -2868,6 +4528,12 @@ func (s *Server) gitProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.localGitHub == nil {
 		writeError(w, r, http.StatusNotImplemented, "GITHUB_CONNECTION_REQUIRED", "GitHub is not configured for this deployment.")
+		return
+	}
+	suffix := chi.URLParam(r, "*")
+	operation, err := cloudlocalgh.GitOperation(r.Method, suffix, r.URL.Query())
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_GIT_REQUEST", "Only Git upload-pack and receive-pack requests are supported.")
 		return
 	}
 	launch, err := s.store.WorkerLaunchSpec(r.Context(), claims.AccountID, claims.SessionID)
@@ -2882,13 +4548,28 @@ func (s *Server) gitProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusForbidden, "REPOSITORY_NOT_AUTHORIZED", "Worker is not authorized for this repository.")
 		return
 	}
+	project, err := s.store.GetProject(r.Context(), claims.AccountID, launch.Session.ProjectID)
+	if err != nil {
+		s.internalError(w, r, "load project for Git proxy", err)
+		return
+	}
+	githubCtx, ok := s.githubOperationContext(
+		w,
+		r,
+		project,
+		operation,
+		"authorize GitHub repository proxy",
+	)
+	if !ok {
+		return
+	}
 	if err := s.localGitHub.ProxyRepository(
-		r.Context(),
+		githubCtx,
 		w,
 		r,
 		expectedOwner,
 		expectedRepository,
-		chi.URLParam(r, "*"),
+		suffix,
 	); err != nil {
 		s.internalError(w, r, "proxy GitHub repository", err)
 	}
@@ -3025,6 +4706,18 @@ func parseAfter(r *http.Request) (int64, error) {
 		return 0, errors.New("invalid after")
 	}
 	return after, nil
+}
+
+func parseCommandPromptSequence(r *http.Request) (int64, error) {
+	raw := r.URL.Query().Get("commandPrompt")
+	if raw == "" {
+		return 0, nil
+	}
+	sequence, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || sequence < 0 {
+		return 0, errors.New("invalid command prompt")
+	}
+	return sequence, nil
 }
 
 func parseLimit(r *http.Request, maximum int) (int, error) {

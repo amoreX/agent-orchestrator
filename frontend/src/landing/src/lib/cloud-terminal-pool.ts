@@ -16,7 +16,7 @@ export type CloudTerminalEvent =
 type Listener = (event: CloudTerminalEvent) => void;
 
 interface TerminalServerMessage {
-  type: "output" | "error" | "reset";
+  type: "output" | "error" | "reset" | "replay_complete";
   data?: string;
   message?: string;
   sequence?: number;
@@ -36,9 +36,11 @@ class CloudTerminalConnection {
   private closed = false;
   private pendingInput: string[] = [];
   private size = { rows: 24, cols: 80 };
+  private canOperate = true;
 
   constructor(
     private readonly api: CloudAPI,
+    private readonly orgId: string,
     private readonly sessionId: string,
     private readonly kind: CloudTerminalKind,
   ) {
@@ -55,6 +57,10 @@ class CloudTerminalConnection {
   }
 
   sendInput(data: string) {
+    if (!this.canOperate) {
+      this.emit({ type: "notice", message: "Terminal is read-only for viewers." });
+      return;
+    }
     if (this.socket?.readyState !== WebSocket.OPEN) {
       if (this.pendingInput.length < 256) this.pendingInput.push(data);
       this.reconnectNow();
@@ -103,7 +109,12 @@ class CloudTerminalConnection {
     this.connectInFlight = true;
     this.setState("connecting");
     try {
-      const { ticket } = await this.api.terminalTicket(this.sessionId, this.kind);
+      const { ticket, scopes } = await this.api.terminalTicket(
+        this.orgId,
+        this.sessionId,
+        this.kind,
+      );
+      this.canOperate = scopes?.includes("terminal:operate") ?? true;
       if (this.closed) return;
       const socket = new WebSocket(
         this.api.terminalURL(ticket, this.lastSequence, this.kind),
@@ -113,9 +124,14 @@ class CloudTerminalConnection {
         if (this.socket !== socket || this.closed) return;
         this.setState("connected");
         this.sendResize();
-        while (this.pendingInput.length > 0) {
-          const input = this.pendingInput.shift();
-          if (input) this.sendInput(input);
+        if (this.canOperate) {
+          while (this.pendingInput.length > 0) {
+            const input = this.pendingInput.shift();
+            if (input) this.sendInput(input);
+          }
+        } else {
+          this.pendingInput = [];
+          this.emit({ type: "notice", message: "Terminal is read-only for viewers." });
         }
       });
       socket.addEventListener("message", (event) => {
@@ -133,6 +149,15 @@ class CloudTerminalConnection {
             type: "notice",
             message: message.message ?? "Terminal command could not be queued.",
           });
+          return;
+        }
+        if (message.type === "replay_complete") {
+          if (!this.canOperate) {
+            this.history = [];
+            this.historyBytes = 0;
+            this.emit({ type: "reset" });
+            this.forceRedraw();
+          }
           return;
         }
         if (message.type !== "output" || !message.data) return;
@@ -190,6 +215,19 @@ class CloudTerminalConnection {
     if (this.socket?.readyState !== WebSocket.OPEN) return;
     this.socket.send(JSON.stringify({ type: "resize", ...this.size }));
   }
+
+  private forceRedraw() {
+    if (this.socket?.readyState !== WebSocket.OPEN) return;
+    const temporaryCols = this.size.cols > 1 ? this.size.cols - 1 : 2;
+    this.socket.send(
+      JSON.stringify({
+        type: "resize",
+        rows: this.size.rows,
+        cols: temporaryCols,
+      }),
+    );
+    this.sendResize();
+  }
 }
 
 let poolAPI: CloudAPI | null = null;
@@ -197,31 +235,30 @@ const connections = new Map<string, CloudTerminalConnection>();
 
 export function ensureCloudTerminalConnection(
   api: CloudAPI,
+  orgId: string,
   sessionId: string,
   kind: CloudTerminalKind = "agent",
 ) {
   if (poolAPI && poolAPI !== api) clearCloudTerminalConnections();
   poolAPI = api;
-  const key = `${sessionId}:${kind}`;
+  const key = `${orgId}:${sessionId}:${kind}`;
   const existing = connections.get(key);
   if (existing) return existing;
-  const connection = new CloudTerminalConnection(api, sessionId, kind);
+  const connection = new CloudTerminalConnection(api, orgId, sessionId, kind);
   connections.set(key, connection);
   return connection;
 }
 
 export function syncCloudTerminalConnections(
   api: CloudAPI,
+  orgId: string,
   sessionIds: string[],
 ) {
   if (poolAPI && poolAPI !== api) clearCloudTerminalConnections();
   poolAPI = api;
   const active = new Set(sessionIds);
-  for (const sessionId of sessionIds) {
-    ensureCloudTerminalConnection(api, sessionId);
-  }
   for (const [key, connection] of connections) {
-    const sessionId = key.split(":", 1)[0];
+    const [, sessionId] = key.split(":");
     if (active.has(sessionId)) continue;
     connection.close();
     connections.delete(key);

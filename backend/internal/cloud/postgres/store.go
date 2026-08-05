@@ -111,36 +111,252 @@ func (s *Store) Ping(ctx context.Context) error {
 
 // EnsureAccount returns the account owned by a user, creating it when necessary.
 func (s *Store) EnsureAccount(ctx context.Context, ownerUserID, displayName string) (clouddomain.Account, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return clouddomain.Account{}, fmt.Errorf("begin ensure account: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	var account clouddomain.Account
-	err := s.pool.QueryRow(ctx, `
-		INSERT INTO ao_accounts (owner_user_id, display_name)
-		VALUES ($1, $2)
-		ON CONFLICT (owner_user_id) DO UPDATE
-		SET display_name = CASE
-			WHEN ao_accounts.display_name = '' THEN EXCLUDED.display_name
-			ELSE ao_accounts.display_name
-		END,
-		updated_at = now()
-		RETURNING id, owner_user_id, display_name, created_at, updated_at
-	`, ownerUserID, displayName).Scan(
+	err = tx.QueryRow(ctx, `
+		SELECT id, owner_user_id, display_name, created_at, updated_at
+		FROM ao_accounts
+		WHERE owner_user_id = $1
+		ORDER BY created_at
+		LIMIT 1
+	`, ownerUserID).Scan(
 		&account.ID,
 		&account.OwnerUserID,
 		&account.DisplayName,
 		&account.CreatedAt,
 		&account.UpdatedAt,
 	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = tx.QueryRow(ctx, `
+			INSERT INTO ao_accounts (owner_user_id, display_name)
+			VALUES ($1, $2)
+			RETURNING id, owner_user_id, display_name, created_at, updated_at
+		`, ownerUserID, displayName).Scan(
+			&account.ID,
+			&account.OwnerUserID,
+			&account.DisplayName,
+			&account.CreatedAt,
+			&account.UpdatedAt,
+		)
+	}
 	if err != nil {
 		return clouddomain.Account{}, fmt.Errorf("ensure account: %w", err)
+	}
+	if err := ensureUserOrgTx(ctx, tx, account, displayName); err != nil {
+		return clouddomain.Account{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return clouddomain.Account{}, fmt.Errorf("commit ensure account: %w", err)
 	}
 	return account, nil
 }
 
+// ExternalAccountCanSignIn reports whether an external identity may enter AO
+// when public self-serve signup is disabled.
+func (s *Store) ExternalAccountCanSignIn(
+	ctx context.Context,
+	authProvider string,
+	externalUserID string,
+	email string,
+) (bool, error) {
+	var allowed bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM ao_users cloud_user
+			JOIN ao_accounts account ON account.owner_user_id = cloud_user.id
+			WHERE cloud_user.auth_provider = $1
+				AND cloud_user.external_user_id = $2
+		) OR EXISTS (
+			SELECT 1
+			FROM ao_org_invitations invite
+			WHERE invite.status = 'pending'
+				AND invite.expires_at > now()
+				AND lower(invite.email) = lower($3)
+		)
+	`, strings.TrimSpace(authProvider), strings.TrimSpace(externalUserID), strings.ToLower(strings.TrimSpace(email))).Scan(&allowed)
+	if err != nil {
+		return false, fmt.Errorf("check external account signup gate: %w", err)
+	}
+	return allowed, nil
+}
+
+// EnsureExternalAccount maps an external auth user into AO's durable user/account model.
+func (s *Store) EnsureExternalAccount(
+	ctx context.Context,
+	authProvider string,
+	externalUserID string,
+	email string,
+	displayName string,
+	createPersonalOrg bool,
+) (clouddomain.Account, error) {
+	authProvider = strings.TrimSpace(authProvider)
+	externalUserID = strings.TrimSpace(externalUserID)
+	email = strings.ToLower(strings.TrimSpace(email))
+	displayName = strings.TrimSpace(displayName)
+	if authProvider == "" || externalUserID == "" {
+		return clouddomain.Account{}, fmt.Errorf("external auth provider and user ID are required")
+	}
+	if displayName == "" {
+		displayName = firstNonEmpty(email, externalUserID)
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return clouddomain.Account{}, fmt.Errorf("begin ensure external account: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var user clouddomain.User
+	err = tx.QueryRow(ctx, `
+		INSERT INTO ao_users (auth_provider, external_user_id, email, display_name)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (auth_provider, external_user_id) DO UPDATE
+		SET email = CASE
+				WHEN EXCLUDED.email <> '' THEN EXCLUDED.email
+				ELSE ao_users.email
+			END,
+			display_name = CASE
+				WHEN ao_users.display_name = ''
+					OR ao_users.display_name = ao_users.external_user_id
+				THEN EXCLUDED.display_name
+				ELSE ao_users.display_name
+			END,
+			updated_at = now()
+		RETURNING id, auth_provider, external_user_id, email, display_name, created_at, updated_at
+	`, authProvider, externalUserID, email, displayName).Scan(
+		&user.ID,
+		&user.AuthProvider,
+		&user.ExternalUserID,
+		&user.Email,
+		&user.DisplayName,
+		&user.CreatedAt,
+		&user.UpdatedAt,
+	)
+	if err != nil {
+		return clouddomain.Account{}, fmt.Errorf("ensure external cloud user: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE ao_accounts
+		SET display_name = $2, updated_at = now()
+		WHERE owner_user_id = $1
+		  AND (display_name = '' OR display_name = $3)
+	`, user.ID, user.DisplayName, externalUserID); err != nil {
+		return clouddomain.Account{}, fmt.Errorf("repair external account display name: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE ao_organizations AS organization
+		SET display_name = $2, updated_at = now()
+		FROM ao_accounts AS account
+		WHERE organization.id = account.id
+		  AND account.owner_user_id = $1
+		  AND organization.kind = 'personal'
+		  AND (organization.display_name = '' OR organization.display_name = $3)
+	`, user.ID, user.DisplayName, externalUserID); err != nil {
+		return clouddomain.Account{}, fmt.Errorf("repair personal organization display name: %w", err)
+	}
+
+	var account clouddomain.Account
+	err = tx.QueryRow(ctx, `
+		SELECT id, owner_user_id, display_name, created_at, updated_at
+		FROM ao_accounts
+		WHERE owner_user_id = $1
+		ORDER BY created_at
+		LIMIT 1
+	`, user.ID).Scan(
+		&account.ID,
+		&account.OwnerUserID,
+		&account.DisplayName,
+		&account.CreatedAt,
+		&account.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = tx.QueryRow(ctx, `
+			INSERT INTO ao_accounts (owner_user_id, display_name)
+			VALUES ($1, $2)
+			RETURNING id, owner_user_id, display_name, created_at, updated_at
+		`, user.ID, user.DisplayName).Scan(
+			&account.ID,
+			&account.OwnerUserID,
+			&account.DisplayName,
+			&account.CreatedAt,
+			&account.UpdatedAt,
+		)
+	}
+	if err != nil {
+		return clouddomain.Account{}, fmt.Errorf("ensure external account: %w", err)
+	}
+	if createPersonalOrg {
+		if err := ensureUserOrgTx(ctx, tx, account, user.DisplayName); err != nil {
+			return clouddomain.Account{}, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return clouddomain.Account{}, fmt.Errorf("commit ensure external account: %w", err)
+	}
+	return account, nil
+}
+
+func ensureUserOrgTx(ctx context.Context, tx pgx.Tx, account clouddomain.Account, displayName string) error {
+	if strings.TrimSpace(displayName) == "" {
+		displayName = account.DisplayName
+	}
+	if strings.TrimSpace(displayName) == "" {
+		displayName = "Personal workspace"
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO ao_users (id, auth_provider, external_user_id, display_name)
+		VALUES ($1::uuid, 'local', $1, $2)
+		ON CONFLICT (id) DO UPDATE
+		SET display_name = CASE
+			WHEN ao_users.display_name = '' THEN EXCLUDED.display_name
+			ELSE ao_users.display_name
+		END,
+		updated_at = now()
+	`, account.OwnerUserID, displayName); err != nil {
+		return fmt.Errorf("ensure cloud user: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO ao_organizations (
+			id, auth_provider, external_org_id, slug, display_name, kind, plan, status, created_by_user_id
+		)
+		VALUES ($1::uuid, 'local', $1, $2, $3, 'personal', 'free', 'active', $4)
+		ON CONFLICT (id) DO UPDATE
+		SET display_name = CASE
+			WHEN ao_organizations.display_name = '' THEN EXCLUDED.display_name
+			ELSE ao_organizations.display_name
+		END,
+		updated_at = now()
+	`, account.ID, "personal-"+strings.ReplaceAll(string(account.ID), "-", ""), displayName, account.OwnerUserID); err != nil {
+		return fmt.Errorf("ensure personal organization: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO ao_org_memberships (org_id, user_id, role, status)
+		VALUES ($1, $2, 'owner', 'active')
+		ON CONFLICT (org_id, user_id) DO UPDATE
+		SET role = CASE
+			WHEN ao_org_memberships.role = '' THEN EXCLUDED.role
+			ELSE ao_org_memberships.role
+		END,
+		status = 'active',
+		updated_at = now()
+	`, account.ID, account.OwnerUserID); err != nil {
+		return fmt.Errorf("ensure organization membership: %w", err)
+	}
+	return nil
+}
+
 // CreateProjectInput contains the writable fields of a new project.
 type CreateProjectInput struct {
-	DisplayName   string
-	RepositoryURL string
-	DefaultBranch string
-	Config        json.RawMessage
+	DisplayName        string
+	RepositoryURL      string
+	DefaultBranch      string
+	GitHubRepositoryID *int64
+	Config             json.RawMessage
 }
 
 // CreateProject creates a repository-backed project in an account.
@@ -155,17 +371,35 @@ func (s *Store) CreateProject(
 	var project clouddomain.Project
 	err := s.pool.QueryRow(ctx, `
 		INSERT INTO ao_projects (
-			account_id, display_name, repository_url, default_branch, config
+			account_id, org_id, display_name, repository_url, default_branch,
+			github_repository_id, github_repository_grant_id, config
 		)
-		VALUES ($1, $2, $3, $4, $5)
-		RETURNING id, account_id, display_name, repository_url, default_branch,
-			config, created_at, updated_at
-	`, accountID, input.DisplayName, input.RepositoryURL, input.DefaultBranch, input.Config).Scan(
+		VALUES (
+			$1, $1, $2, $3, $4, $5,
+			CASE WHEN $5::bigint IS NULL THEN NULL ELSE (
+				SELECT repository_grant.id
+				FROM ao_github_repository_grants repository_grant
+				JOIN ao_github_installations installation
+					ON installation.org_id = repository_grant.org_id
+					AND installation.id = repository_grant.installation_id
+				WHERE repository_grant.org_id = $1
+					AND repository_grant.github_repository_id = $5
+					AND repository_grant.revoked_at IS NULL
+					AND installation.status = 'active'
+			) END,
+			$6
+		)
+		RETURNING id, account_id, org_id, display_name, repository_url, default_branch,
+			github_repository_id, config, created_at, updated_at
+	`, accountID, input.DisplayName, input.RepositoryURL, input.DefaultBranch,
+		input.GitHubRepositoryID, input.Config).Scan(
 		&project.ID,
 		&project.AccountID,
+		&project.OrgID,
 		&project.DisplayName,
 		&project.RepositoryURL,
 		&project.DefaultBranch,
+		&project.GitHubRepositoryID,
 		&project.Config,
 		&project.CreatedAt,
 		&project.UpdatedAt,
@@ -173,7 +407,8 @@ func (s *Store) CreateProject(
 	if err != nil {
 		var postgresError *pgconn.PgError
 		if errors.As(err, &postgresError) &&
-			postgresError.ConstraintName == "ao_projects_account_id_repository_url_key" {
+			(postgresError.ConstraintName == "ao_projects_account_id_repository_url_key" ||
+				postgresError.ConstraintName == "ao_projects_org_repository_url_key") {
 			return clouddomain.Project{}, ErrProjectExists
 		}
 		return clouddomain.Project{}, fmt.Errorf("create project: %w", err)
@@ -187,10 +422,10 @@ func (s *Store) ListProjects(
 	accountID clouddomain.AccountID,
 ) ([]clouddomain.Project, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, account_id, display_name, repository_url, default_branch,
-			config, created_at, updated_at
+		SELECT id, account_id, org_id, display_name, repository_url, default_branch,
+			github_repository_id, config, created_at, updated_at
 		FROM ao_projects
-		WHERE account_id = $1
+		WHERE org_id = $1
 		ORDER BY created_at
 	`, accountID)
 	if err != nil {
@@ -203,9 +438,11 @@ func (s *Store) ListProjects(
 		if err := rows.Scan(
 			&project.ID,
 			&project.AccountID,
+			&project.OrgID,
 			&project.DisplayName,
 			&project.RepositoryURL,
 			&project.DefaultBranch,
+			&project.GitHubRepositoryID,
 			&project.Config,
 			&project.CreatedAt,
 			&project.UpdatedAt,
@@ -225,16 +462,18 @@ func (s *Store) GetProject(
 ) (clouddomain.Project, error) {
 	var project clouddomain.Project
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, account_id, display_name, repository_url, default_branch,
-			config, created_at, updated_at
+		SELECT id, account_id, org_id, display_name, repository_url, default_branch,
+			github_repository_id, config, created_at, updated_at
 		FROM ao_projects
-		WHERE account_id = $1 AND id = $2
+		WHERE org_id = $1 AND id = $2
 	`, accountID, projectID).Scan(
 		&project.ID,
 		&project.AccountID,
+		&project.OrgID,
 		&project.DisplayName,
 		&project.RepositoryURL,
 		&project.DefaultBranch,
+		&project.GitHubRepositoryID,
 		&project.Config,
 		&project.CreatedAt,
 		&project.UpdatedAt,
@@ -248,18 +487,54 @@ func (s *Store) GetProject(
 	return project, nil
 }
 
+// DeleteProject removes one account-owned project and all dependent cloud rows.
+func (s *Store) DeleteProject(
+	ctx context.Context,
+	accountID clouddomain.AccountID,
+	projectID clouddomain.ProjectID,
+) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin delete cloud project: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM ao_session_issue_links
+		WHERE session_id IN (
+			SELECT id FROM ao_sessions WHERE org_id = $1 AND project_id = $2
+		)
+	`, accountID, projectID); err != nil {
+		return fmt.Errorf("delete project issue links: %w", err)
+	}
+	tag, err := tx.Exec(ctx, `
+		DELETE FROM ao_projects
+		WHERE org_id = $1 AND id = $2
+	`, accountID, projectID)
+	if err != nil {
+		return fmt.Errorf("delete cloud project: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrProjectNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit delete cloud project: %w", err)
+	}
+	return nil
+}
+
 // CreateSessionInput contains the durable settings for a new session.
 type CreateSessionInput struct {
-	IdempotencyKey       string
-	ProjectID            clouddomain.ProjectID
-	Kind                 string
-	Harness              string
-	DisplayName          string
-	Branch               string
-	Prompt               string
-	Resource             clouddomain.ResourceProfile
-	Provider             string
-	ProviderConnectionID string
+	IdempotencyKey           string
+	ProjectID                clouddomain.ProjectID
+	Kind                     string
+	Harness                  string
+	DisplayName              string
+	Branch                   string
+	Prompt                   string
+	Resource                 clouddomain.ResourceProfile
+	Provider                 string
+	ProviderConnectionID     string
+	MaxActiveSandboxesPerOrg int `json:"-"`
 }
 
 // CreateSessionResult contains the session creation receipt and resources.
@@ -293,10 +568,10 @@ func (s *Store) CreateSession(
 	var insertedID string
 	err = tx.QueryRow(ctx, `
 		INSERT INTO ao_commands (
-			id, account_id, idempotency_key, kind, payload
+			id, account_id, org_id, idempotency_key, kind, payload
 		)
-		VALUES ($1, $2, $3, 'session.create', $4)
-		ON CONFLICT (account_id, idempotency_key) DO NOTHING
+		VALUES ($1, $2, $2, $3, 'session.create', $4)
+		ON CONFLICT (org_id, idempotency_key) DO NOTHING
 		RETURNING id
 	`, commandID, accountID, input.IdempotencyKey, payload).Scan(&insertedID)
 	switch {
@@ -327,17 +602,18 @@ func (s *Store) CreateSession(
 	var session clouddomain.Session
 	err = tx.QueryRow(ctx, `
 		INSERT INTO ao_sessions (
-			id, account_id, project_id, kind, harness, display_name, branch, prompt
+			id, account_id, org_id, project_id, kind, harness, display_name, branch, prompt
 		)
-		SELECT $1, $2, id, $3, $4, $5, $6, $7
+		SELECT $1, $2, $2, id, $3, $4, $5, $6, $7
 		FROM ao_projects
-		WHERE id = $8 AND account_id = $2
-		RETURNING id, account_id, project_id, kind, harness, display_name, branch,
+		WHERE id = $8 AND org_id = $2
+		RETURNING id, account_id, org_id, project_id, kind, harness, display_name, branch,
 			prompt, activity_state, is_terminated, agent_session_id, created_at,
 			updated_at
 	`, sessionID, accountID, input.Kind, input.Harness, input.DisplayName, input.Branch, input.Prompt, input.ProjectID).Scan(
 		&session.ID,
 		&session.AccountID,
+		&session.OrgID,
 		&session.ProjectID,
 		&session.Kind,
 		&session.Harness,
@@ -361,6 +637,19 @@ func (s *Store) CreateSession(
 		}
 		return CreateSessionResult{}, fmt.Errorf("insert session: %w", err)
 	}
+	if input.MaxActiveSandboxesPerOrg > 0 {
+		var activeSandboxes int
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*)
+			FROM ao_sandboxes
+			WHERE org_id = $1 AND desired_state <> 'deleted'
+		`, accountID).Scan(&activeSandboxes); err != nil {
+			return CreateSessionResult{}, fmt.Errorf("count active sandboxes: %w", err)
+		}
+		if activeSandboxes >= input.MaxActiveSandboxesPerOrg {
+			return CreateSessionResult{}, ErrSandboxQuotaExceeded
+		}
+	}
 	session.Status = string(deriveCloudStatus(session, nil))
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO ao_session_sequences (session_id, next_sequence)
@@ -377,16 +666,16 @@ func (s *Store) CreateSession(
 	var sandbox clouddomain.Sandbox
 	err = tx.QueryRow(ctx, `
 		INSERT INTO ao_sandboxes (
-			session_id, account_id, provider, provider_connection_id,
+			session_id, account_id, org_id, provider, provider_connection_id,
 			desired_state, observed_state, resource_profile
 		)
-		SELECT $1, $2, $5, connection.id, 'running', 'requested', $3
+		SELECT $1, $2, $2, $5, connection.id, 'running', 'requested', $3
 		FROM (SELECT 1) seed
 		LEFT JOIN ao_provider_connections connection
-			ON connection.account_id = $2
+			ON connection.org_id = $2
 			AND connection.id = NULLIF($4, '')::uuid
 		WHERE $4 = '' OR connection.id IS NOT NULL
-		RETURNING session_id, account_id, provider,
+		RETURNING session_id, account_id, org_id, provider,
 			COALESCE(provider_environment_id, ''),
 			COALESCE(provider_connection_id::text, ''),
 			desired_state, observed_state, resource_profile, worker_last_seen_at,
@@ -394,6 +683,7 @@ func (s *Store) CreateSession(
 	`, session.ID, accountID, resourceJSON, input.ProviderConnectionID, input.Provider).Scan(
 		&sandbox.SessionID,
 		&sandbox.AccountID,
+		&sandbox.OrgID,
 		&sandbox.Provider,
 		&sandbox.ProviderEnvironmentID,
 		&sandbox.ProviderConnectionID,
@@ -447,10 +737,10 @@ func (s *Store) CreateSession(
 		}
 		turn, err := scanTurn(tx.QueryRow(ctx, `
 			INSERT INTO ao_turns (
-				id, account_id, session_id, user_message_sequence, state
+				id, account_id, org_id, session_id, user_message_sequence, state
 			)
-			VALUES ($1, $2, $3, $4, 'provisioning')
-			RETURNING id, account_id, session_id, user_message_sequence, state,
+			VALUES ($1, $2, $2, $3, $4, 'provisioning')
+			RETURNING id, account_id, org_id, session_id, user_message_sequence, state,
 				worker_epoch, attempt_count, error_message, started_at, completed_at,
 				created_at, updated_at
 		`, turnID, accountID, session.ID, promptEvent.Sequence))
@@ -476,11 +766,12 @@ func (s *Store) CreateSession(
 		UPDATE ao_commands
 		SET session_id = $2, status = 'succeeded', result = $3, updated_at = now()
 		WHERE id = $1
-		RETURNING id, account_id, session_id, idempotency_key, kind, status,
+		RETURNING id, account_id, org_id, session_id, idempotency_key, kind, status,
 			result, error_code, error_message, created_at, updated_at
 	`, commandID, session.ID, resultJSON).Scan(
 		&command.ID,
 		&command.AccountID,
+		&command.OrgID,
 		&command.SessionID,
 		&command.IdempotencyKey,
 		&command.Kind,
@@ -511,14 +802,15 @@ func loadCreateSessionResult(
 	var receipt clouddomain.CommandReceipt
 	var payloadRaw, resultRaw []byte
 	err := tx.QueryRow(ctx, `
-		SELECT id, account_id, COALESCE(session_id::text, ''), idempotency_key,
+		SELECT id, account_id, org_id, COALESCE(session_id::text, ''), idempotency_key,
 			kind, payload, status, result, error_code, error_message, created_at,
 			updated_at
 		FROM ao_commands
-		WHERE account_id = $1 AND idempotency_key = $2
+		WHERE org_id = $1 AND idempotency_key = $2
 	`, accountID, idempotencyKey).Scan(
 		&receipt.ID,
 		&receipt.AccountID,
+		&receipt.OrgID,
 		&receipt.SessionID,
 		&receipt.IdempotencyKey,
 		&receipt.Kind,
@@ -533,6 +825,7 @@ func loadCreateSessionResult(
 	if err != nil {
 		return CreateSessionResult{}, fmt.Errorf("load command receipt: %w", err)
 	}
+	expectedInput.MaxActiveSandboxesPerOrg = 0
 	var existingInput CreateSessionInput
 	if receipt.Kind != "session.create" ||
 		json.Unmarshal(payloadRaw, &existingInput) != nil ||
@@ -566,11 +859,11 @@ func (s *Store) ListSessions(
 	accountID clouddomain.AccountID,
 ) ([]clouddomain.Session, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, account_id, project_id, kind, harness, display_name, branch,
+		SELECT id, account_id, org_id, project_id, kind, harness, display_name, branch,
 			prompt, activity_state, is_terminated, agent_session_id, created_at,
 			updated_at
 		FROM ao_sessions
-		WHERE account_id = $1
+		WHERE org_id = $1
 		ORDER BY created_at
 	`, accountID)
 	if err != nil {
@@ -583,6 +876,7 @@ func (s *Store) ListSessions(
 		if err := rows.Scan(
 			&session.ID,
 			&session.AccountID,
+			&session.OrgID,
 			&session.ProjectID,
 			&session.Kind,
 			&session.Harness,
@@ -660,7 +954,7 @@ func (s *Store) GetSession(
 	return session, nil
 }
 
-// DeleteSession removes one account-owned worker session and all dependent cloud rows.
+// DeleteSession removes one account-owned session and all dependent cloud rows.
 func (s *Store) DeleteSession(
 	ctx context.Context,
 	accountID clouddomain.AccountID,
@@ -668,7 +962,7 @@ func (s *Store) DeleteSession(
 ) error {
 	tag, err := s.pool.Exec(ctx, `
 		DELETE FROM ao_sessions
-		WHERE account_id = $1 AND id = $2 AND kind = 'worker'
+		WHERE org_id = $1 AND id = $2
 	`, accountID, sessionID)
 	if err != nil {
 		return fmt.Errorf("delete cloud session: %w", err)
@@ -692,7 +986,7 @@ func (s *Store) sessionRuntime(
 				AND disconnected_at IS NULL
 				AND last_seen_at > now() - interval '45 seconds'
 		FROM ao_worker_connections
-		WHERE account_id = $1 AND session_id = $2
+		WHERE org_id = $1 AND session_id = $2
 	`, accountID, sessionID).Scan(&raw, &connected)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return []string{}, false, nil
@@ -724,7 +1018,7 @@ func (s *Store) sessionStatus(
 					AND t.is_outdated = false
 			) AS has_unresolved_threads
 		FROM ao_pull_requests pr
-		WHERE account_id = $1 AND session_id = $2
+		WHERE org_id = $1 AND session_id = $2
 		ORDER BY updated_at DESC
 	`, accountID, session.ID)
 	if err != nil {
@@ -763,7 +1057,7 @@ func (s *Store) sessionStatus(
 		claimRows, claimErr := s.pool.Query(ctx, `
 			SELECT number, url
 			FROM ao_pr_claims
-			WHERE account_id = $1 AND session_id = $2 AND released_at IS NULL
+			WHERE org_id = $1 AND session_id = $2 AND released_at IS NULL
 			ORDER BY claimed_at DESC
 		`, accountID, session.ID)
 		if claimErr != nil {
@@ -830,7 +1124,7 @@ func appendEventTx(
 		FROM ao_sessions session
 		WHERE seq.session_id = $1
 			AND session.id = seq.session_id
-			AND session.account_id = $2
+			AND session.org_id = $2
 		RETURNING seq.next_sequence - 1
 	`, sessionID, accountID).Scan(&sequence)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -844,8 +1138,8 @@ func appendEventTx(
 	}
 	var event clouddomain.Event
 	err = tx.QueryRow(ctx, `
-		INSERT INTO ao_events (account_id, session_id, sequence, type, payload)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO ao_events (account_id, org_id, session_id, sequence, type, payload)
+		VALUES ($1, $1, $2, $3, $4, $5)
 		RETURNING session_id, sequence, type, payload, created_at
 	`, accountID, sessionID, sequence, eventType, payload).Scan(
 		&event.SessionID,
@@ -881,12 +1175,12 @@ func (s *Store) AppendUserMessage(
 	var insertedID string
 	err = tx.QueryRow(ctx, `
 		INSERT INTO ao_commands (
-			id, account_id, session_id, idempotency_key, kind, payload
+			id, account_id, org_id, session_id, idempotency_key, kind, payload
 		)
-		SELECT $1, $2, session.id, $4, 'session.message', $5
+		SELECT $1, $2, $2, session.id, $4, 'session.message', $5
 		FROM ao_sessions session
-		WHERE session.id = $3 AND session.account_id = $2
-		ON CONFLICT (account_id, idempotency_key) DO NOTHING
+		WHERE session.id = $3 AND session.org_id = $2
+		ON CONFLICT (org_id, idempotency_key) DO NOTHING
 		RETURNING id
 	`, commandID, accountID, sessionID, idempotencyKey, commandPayload).Scan(&insertedID)
 	switch {
@@ -919,9 +1213,9 @@ func (s *Store) AppendUserMessage(
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO ao_turns (
-			id, account_id, session_id, user_message_sequence, state
+			id, account_id, org_id, session_id, user_message_sequence, state
 		)
-		VALUES ($1, $2, $3, $4, 'queued')
+		VALUES ($1, $2, $2, $3, $4, 'queued')
 	`, turnID, accountID, sessionID, event.Sequence); err != nil {
 		var postgresError *pgconn.PgError
 		if errors.As(err, &postgresError) &&
@@ -963,7 +1257,7 @@ func loadUserMessageEvent(
 	err := tx.QueryRow(ctx, `
 		SELECT COALESCE(session_id::text, ''), kind, payload, result
 		FROM ao_commands
-		WHERE account_id = $1 AND idempotency_key = $2
+		WHERE org_id = $1 AND idempotency_key = $2
 	`, accountID, idempotencyKey).Scan(&existingSessionID, &kind, &payloadRaw, &resultRaw)
 	if err != nil {
 		return clouddomain.Event{}, fmt.Errorf("load user message command: %w", err)
@@ -986,7 +1280,7 @@ func loadUserMessageEvent(
 	err = tx.QueryRow(ctx, `
 		SELECT session_id, sequence, type, payload, created_at
 		FROM ao_events
-		WHERE account_id = $1 AND session_id = $2 AND sequence = $3
+		WHERE org_id = $1 AND session_id = $2 AND sequence = $3
 	`, accountID, sessionID, result.EventSequence).Scan(
 		&event.SessionID,
 		&event.Sequence,
@@ -1014,7 +1308,7 @@ func (s *Store) EventsAfter(
 	rows, err := s.pool.Query(ctx, `
 		SELECT session_id, sequence, type, payload, created_at
 		FROM ao_events
-		WHERE account_id = $1 AND session_id = $2 AND sequence > $3
+		WHERE org_id = $1 AND session_id = $2 AND sequence > $3
 		ORDER BY sequence
 		LIMIT $4
 	`, accountID, sessionID, after, limit)
@@ -1039,7 +1333,7 @@ func (s *Store) ChatEventsAfter(
 	rows, err := s.pool.Query(ctx, `
 		SELECT session_id, sequence, type, payload, created_at
 		FROM ao_events
-		WHERE account_id = $1
+		WHERE org_id = $1
 			AND session_id = $2
 			AND sequence > $3
 			AND type LIKE 'chat.%'
@@ -1068,7 +1362,7 @@ func (s *Store) ResultEventsAfter(
 	rows, err := s.pool.Query(ctx, `
 		SELECT session_id, sequence, type, payload, created_at
 		FROM ao_events
-		WHERE account_id = $1
+		WHERE org_id = $1
 			AND session_id = $2
 			AND sequence > $3
 			AND (
@@ -1106,7 +1400,7 @@ func (s *Store) ActivePromptEventsAfter(
 		LEFT JOIN ao_turns turn
 			ON turn.session_id = event.session_id
 			AND turn.user_message_sequence = event.sequence
-		WHERE event.account_id = $1
+		WHERE event.org_id = $1
 			AND event.session_id = $2
 			AND event.sequence > $3
 			AND event.type = 'chat.user_message'
@@ -1153,7 +1447,7 @@ func (s *Store) LatestEventSequenceByType(
 	if err := s.pool.QueryRow(ctx, `
 		SELECT COALESCE(MAX(sequence), 0)
 		FROM ao_events
-		WHERE account_id = $1 AND session_id = $2 AND type = $3
+		WHERE org_id = $1 AND session_id = $2 AND type = $3
 	`, accountID, sessionID, eventType).Scan(&sequence); err != nil {
 		return 0, fmt.Errorf("load latest event sequence: %w", err)
 	}
@@ -1175,7 +1469,7 @@ func (s *Store) LatestPromptAcceptedSequence(
 			END
 		), 0)
 		FROM ao_events
-		WHERE account_id = $1
+		WHERE org_id = $1
 			AND session_id = $2
 			AND type = 'worker.prompt_accepted'
 			AND payload ? 'sequence'
@@ -1195,7 +1489,7 @@ func (s *Store) SetAgentSessionID(
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE ao_sessions
 		SET agent_session_id = $3, updated_at = now()
-		WHERE account_id = $1 AND id = $2
+		WHERE org_id = $1 AND id = $2
 	`, accountID, sessionID, agentSessionID)
 	if err != nil {
 		return fmt.Errorf("store agent session ID: %w", err)
@@ -1223,11 +1517,11 @@ func (s *Store) IssueAccessTicket(
 	hash := sha256.Sum256([]byte(token))
 	tag, err := s.pool.Exec(ctx, `
 		INSERT INTO ao_access_tickets (
-			account_id, session_id, purpose, scopes, token_hash, expires_at
+			account_id, org_id, session_id, purpose, scopes, token_hash, expires_at
 		)
-		SELECT $1, $2, $3, $4, $5, now() + $6::interval
+		SELECT $1, $1, $2, $3, $4, $5, now() + $6::interval
 		FROM ao_sessions
-		WHERE id = $2 AND account_id = $1
+		WHERE id = $2 AND org_id = $1
 	`, accountID, sessionID, purpose, scopes, hash[:], intervalString(ttl))
 	if err != nil {
 		return "", fmt.Errorf("store access ticket: %w", err)
@@ -1311,6 +1605,15 @@ func intervalString(duration time.Duration) string {
 	return fmt.Sprintf("%f seconds", duration.Seconds())
 }
 
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func getSessionTx(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -1319,14 +1622,15 @@ func getSessionTx(
 ) (clouddomain.Session, error) {
 	var session clouddomain.Session
 	err := tx.QueryRow(ctx, `
-		SELECT id, account_id, project_id, kind, harness, display_name, branch,
+		SELECT id, account_id, org_id, project_id, kind, harness, display_name, branch,
 			prompt, activity_state, is_terminated, agent_session_id, created_at,
 			updated_at
 		FROM ao_sessions
-		WHERE account_id = $1 AND id = $2
+		WHERE org_id = $1 AND id = $2
 	`, accountID, sessionID).Scan(
 		&session.ID,
 		&session.AccountID,
+		&session.OrgID,
 		&session.ProjectID,
 		&session.Kind,
 		&session.Harness,
@@ -1357,16 +1661,17 @@ func getSandboxTx(
 	var sandbox clouddomain.Sandbox
 	var resourceRaw []byte
 	err := tx.QueryRow(ctx, `
-		SELECT session_id, account_id, provider,
+		SELECT session_id, account_id, org_id, provider,
 			COALESCE(provider_environment_id, ''),
 			COALESCE(provider_connection_id::text, ''),
 			desired_state, observed_state, resource_profile, worker_last_seen_at,
 			last_error, reconcile_after, created_at, updated_at
 		FROM ao_sandboxes
-		WHERE account_id = $1 AND session_id = $2
+		WHERE org_id = $1 AND session_id = $2
 	`, accountID, sessionID).Scan(
 		&sandbox.SessionID,
 		&sandbox.AccountID,
+		&sandbox.OrgID,
 		&sandbox.Provider,
 		&sandbox.ProviderEnvironmentID,
 		&sandbox.ProviderConnectionID,
@@ -1423,6 +1728,8 @@ var (
 	ErrSessionNotFound = errors.New("cloud session not found")
 	// ErrActiveOrchestrator indicates that a project already has a live orchestrator.
 	ErrActiveOrchestrator = errors.New("cloud project already has an active orchestrator")
+	// ErrSandboxQuotaExceeded indicates the org has no room for another sandbox.
+	ErrSandboxQuotaExceeded = errors.New("cloud sandbox quota exceeded")
 	// ErrInvalidTicket indicates that an access ticket is invalid or expired.
 	ErrInvalidTicket = errors.New("cloud access ticket is invalid or expired")
 	// ErrIdempotencyConflict indicates that a key was already used for another command.
@@ -1435,4 +1742,10 @@ var (
 	ErrLocalUserNotFound = errors.New("cloud local user not found")
 	// ErrLocalSessionNotFound indicates the local login token is invalid or expired.
 	ErrLocalSessionNotFound = errors.New("cloud local session not found")
+	// ErrInvalidUserProfile indicates the profile update is invalid.
+	ErrInvalidUserProfile = errors.New("cloud user profile is invalid")
+	// ErrCloudUserNotFound indicates the cloud user row does not exist.
+	ErrCloudUserNotFound = errors.New("cloud user not found")
+	// ErrOrgMembershipNotFound indicates the user does not belong to the org.
+	ErrOrgMembershipNotFound = errors.New("cloud organization membership not found")
 )

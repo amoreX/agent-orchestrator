@@ -1,18 +1,107 @@
 import { env } from "@/env";
 
 export interface CloudRepository {
+  id?: number;
   fullName: string;
   url: string;
   defaultBranch: string;
   private: boolean;
 }
 
+export interface CloudGitHubInstallation {
+  id: string;
+  githubInstallationId: number;
+  accountLogin: string;
+  accountType: string;
+  status: string;
+  repositorySelection: string;
+}
+
+export interface CloudGitHubGrantedRepository {
+  repository: {
+    id: number;
+    fullName: string;
+    htmlUrl: string;
+    defaultBranch: string;
+    private: boolean;
+    archived: boolean;
+    disabled: boolean;
+  };
+  grant: {
+    installationId: string;
+    githubInstallationId: number;
+    repositorySelection: string;
+    grantedAt: string;
+    lastSyncedAt: string;
+  };
+}
+
+export interface CloudGitHubConnection {
+  mode: "local-gh" | "github-app" | "disabled";
+  appSlug: string;
+  installations: CloudGitHubInstallation[];
+  repositories: CloudGitHubGrantedRepository[];
+}
+
+export interface CloudGitHubPendingInstallation {
+  accountLogin: string;
+  accountType: string;
+  repositorySelection: "all" | "selected";
+  repositoryCount: number;
+}
+
 export interface CloudProject {
   id: string;
+  orgId: string;
   displayName: string;
   repositoryUrl: string;
   defaultBranch: string;
   config: Record<string, unknown>;
+}
+
+export interface CloudOrganization {
+  id: string;
+  slug: string;
+  displayName: string;
+  kind: "personal" | "team" | "enterprise";
+  plan: string;
+  status: "active" | "disabled";
+}
+
+export interface CloudOrgMembership {
+  id: string;
+  orgId: string;
+  userId: string;
+  role: "owner" | "admin" | "member" | "viewer";
+  status: "active" | "disabled";
+}
+
+export interface CloudUserOrganization {
+  organization: CloudOrganization;
+  membership: CloudOrgMembership;
+}
+
+export interface CloudUser {
+  id: string;
+  email: string;
+  displayName: string;
+}
+
+export interface CloudOrgMember {
+  user: CloudUser;
+  membership: CloudOrgMembership;
+}
+
+export interface CloudOrgInvitation {
+  id: string;
+  orgId: string;
+  email: string;
+  invitedByEmail?: string;
+  invitedByName?: string;
+  role: "owner" | "admin" | "member" | "viewer";
+  status: "pending" | "accepted" | "declined" | "revoked" | "expired";
+  expiresAt: string;
+  createdAt: string;
 }
 
 export interface CloudSession {
@@ -41,6 +130,56 @@ export interface CloudSession {
   activeTurn?: CloudTurn;
   isTerminated: boolean;
   createdAt: string;
+}
+
+export interface CloudSharedProject {
+  id: string;
+  orgId: string;
+  project: CloudProject;
+  session?: CloudSession;
+  sessions?: CloudSession[];
+  role: "viewer" | "editor";
+  sharedByEmail: string;
+  sharedByName: string;
+  redeemedAt: string;
+}
+
+export interface CloudProjectShareRecipient {
+  id: string;
+  shareLinkId: string;
+  recipientType: "email" | "org";
+  email?: string;
+  orgId?: string;
+  orgName?: string;
+  createdAt: string;
+}
+
+export interface CloudProjectShareLink {
+  id: string;
+  orgId: string;
+  projectId: string;
+  sessionId?: string;
+  createdByUserId: string;
+  role: "viewer" | "editor";
+  status: "active" | "revoked";
+  accessScope: "anyone" | "restricted";
+  recipients?: CloudProjectShareRecipient[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CloudProjectShareGrant {
+  id: string;
+  user: CloudUser;
+  role: "viewer" | "editor";
+  status: "active" | "revoked";
+  redeemedAt: string;
+  updatedAt: string;
+}
+
+export interface CloudProjectShareAccess {
+  links: CloudProjectShareLink[];
+  grants: CloudProjectShareGrant[];
 }
 
 export interface CloudTurn {
@@ -144,11 +283,15 @@ export interface ProviderConnection {
   validatedAt?: string;
 }
 
+export type AgentCredentialsMode = "custom" | "personal_default";
+
 export type CloudAgent = "claude-code" | "codex" | "cursor";
 export type AgentCredentialType = "oauth_token" | "api_key" | "access_token";
 
 export interface CloudAuthSession {
   accessToken: string;
+  authProvider?: "local" | "workos";
+  providerSessionToken?: string;
   user: {
     id: string;
     email: string;
@@ -159,6 +302,18 @@ export interface CloudAuthSession {
 type FetchOptions = Omit<RequestInit, "body"> & {
   body?: unknown;
 };
+
+export class CloudAPIError extends Error {
+  readonly code?: string;
+  readonly status: number;
+
+  constructor(message: string, status: number, code?: string) {
+    super(message);
+    this.name = "CloudAPIError";
+    this.status = status;
+    this.code = code;
+  }
+}
 
 export class CloudAPI {
   readonly baseURL: string;
@@ -175,6 +330,7 @@ export class CloudAPI {
   static async signUp(input: {
     email: string;
     password: string;
+    displayName?: string;
   }): Promise<CloudAuthSession> {
     return CloudAPI.authRequest("/api/cloud/v1/auth/signup", input);
   }
@@ -213,50 +369,280 @@ export class CloudAPI {
   }
 
   async me() {
-    return this.request<{ sandboxProvider: "daytona" | "fly" }>(
+    return this.request<{
+      user: CloudUser;
+      sandboxProvider: "daytona" | "fly";
+      organizations: CloudUserOrganization[];
+    }>(
       "/api/cloud/v1/me",
     );
   }
 
-  async repositories() {
-    return this.request<{ repositories: CloudRepository[] }>(
-      "/api/cloud/v1/repositories",
+  async updateProfile(input: { displayName: string }) {
+    return this.request<{ user: CloudUser }>("/api/cloud/v1/me", {
+      method: "PATCH",
+      body: input,
+    });
+  }
+
+  async organizations() {
+    return this.request<{ organizations: CloudUserOrganization[] }>(
+      "/api/cloud/v1/orgs",
     );
   }
 
-  async projects() {
-    return this.request<{ projects: CloudProject[] }>("/api/cloud/v1/projects");
+  async createOrganization(input: { displayName: string }) {
+    return this.request<{ organization: CloudUserOrganization }>(
+      "/api/cloud/v1/orgs",
+      { method: "POST", body: input },
+    );
   }
 
-  async createProject(input: {
+  async updateOrganization(orgId: string, input: { displayName: string }) {
+    return this.request<{ organization: CloudOrganization }>(
+      this.orgPath(orgId, "/"),
+      { method: "PATCH", body: input },
+    );
+  }
+
+  async invitations() {
+    return this.request<{ invitations: CloudOrgInvitation[] }>(
+      "/api/cloud/v1/invitations",
+    );
+  }
+
+  async acceptInvitation(invitationId: string) {
+    return this.request<{ membership: CloudOrgMembership }>(
+      `/api/cloud/v1/invitations/${encodeURIComponent(invitationId)}/accept`,
+      { method: "POST", body: {} },
+    );
+  }
+
+  async declineInvitation(invitationId: string) {
+    return this.request<void>(
+      `/api/cloud/v1/invitations/${encodeURIComponent(invitationId)}/decline`,
+      { method: "POST", body: {} },
+    );
+  }
+
+  async orgInvitations(orgId: string) {
+    return this.request<{ invitations: CloudOrgInvitation[] }>(
+      this.orgPath(orgId, "/invitations"),
+    );
+  }
+
+  async orgMembers(orgId: string) {
+    return this.request<{ members: CloudOrgMember[] }>(
+      this.orgPath(orgId, "/members"),
+    );
+  }
+
+  async updateOrgMemberRole(
+    orgId: string,
+    userId: string,
+    input: { role: CloudOrgMembership["role"] },
+  ) {
+    return this.request<{ member: CloudOrgMember }>(
+      this.orgPath(orgId, `/members/${encodeURIComponent(userId)}`),
+      { method: "PATCH", body: input },
+    );
+  }
+
+  async inviteToOrg(orgId: string, input: { email: string; role: string }) {
+    return this.request<{ invitation: CloudOrgInvitation }>(
+      this.orgPath(orgId, "/invitations"),
+      { method: "POST", body: input },
+    );
+  }
+
+  async revokeInvitation(orgId: string, invitationId: string) {
+    return this.request<void>(
+      this.orgPath(
+        orgId,
+        `/invitations/${encodeURIComponent(invitationId)}/revoke`,
+      ),
+      { method: "POST", body: {} },
+    );
+  }
+
+  async repositories(orgId: string) {
+    return this.request<{ repositories: CloudRepository[] }>(
+      this.orgPath(orgId, "/repositories"),
+    );
+  }
+
+  async githubConnection(orgId: string) {
+    return this.request<CloudGitHubConnection>(
+      this.orgPath(orgId, "/github"),
+    );
+  }
+
+  async startGitHubInstall(orgId: string) {
+    return this.request<{ installUrl: string }>(
+      this.orgPath(orgId, "/github/install"),
+      { method: "POST", body: {} },
+    );
+  }
+
+  async pendingGitHubInstall(orgId: string, state: string) {
+    return this.request<CloudGitHubPendingInstallation>(
+      this.orgPath(orgId, "/github/install/pending"),
+      { method: "POST", body: { state } },
+    );
+  }
+
+  async confirmGitHubInstall(orgId: string, input: { state: string }) {
+    return this.request<void>(
+      this.orgPath(orgId, "/github/install/confirm"),
+      { method: "POST", body: input },
+    );
+  }
+
+  async syncGitHub(orgId: string) {
+    return this.request<void>(
+      this.orgPath(orgId, "/github/sync"),
+      { method: "POST", body: {} },
+    );
+  }
+
+  async disconnectGitHubInstallation(
+    orgId: string,
+    installationId: number,
+  ) {
+    return this.request<void>(
+      this.orgPath(
+        orgId,
+        `/github/installations/${encodeURIComponent(installationId)}`,
+      ),
+      { method: "DELETE" },
+    );
+  }
+
+  async projects(orgId: string) {
+    return this.request<{ projects: CloudProject[] }>(
+      this.orgPath(orgId, "/projects"),
+    );
+  }
+
+  async createProject(orgId: string, input: {
     displayName: string;
     repositoryUrl: string;
     defaultBranch: string;
+    githubRepositoryId?: number;
     config?: Record<string, unknown>;
   }) {
-    return this.request<{ project: CloudProject }>("/api/cloud/v1/projects", {
+    return this.request<{ project: CloudProject }>(this.orgPath(orgId, "/projects"), {
       method: "POST",
       body: input,
     });
   }
 
-  async sessions() {
-    return this.request<{ sessions: CloudSession[] }>("/api/cloud/v1/sessions");
-  }
-
-  async activeTurn(sessionId: string) {
-    return this.request<{ turn: CloudTurn | null }>(
-      `/api/cloud/v1/sessions/${encodeURIComponent(sessionId)}/active-turn`,
+  async deleteProject(orgId: string, projectId: string) {
+    return this.request<void>(
+      this.orgPath(orgId, `/projects/${encodeURIComponent(projectId)}`),
+      { method: "DELETE" },
     );
   }
 
-  async sessionSCM(sessionId: string) {
+  async createProjectShareLink(
+    orgId: string,
+    projectId: string,
+    input: {
+      sessionId?: string;
+      role: "viewer" | "editor";
+      accessScope?: "anyone" | "restricted";
+      recipientEmails?: string[];
+      recipientOrgIds?: string[];
+    },
+  ) {
+    return this.request<{ token: string; shareLink: CloudProjectShareLink }>(
+      this.orgPath(orgId, `/projects/${encodeURIComponent(projectId)}/shares`),
+      { method: "POST", body: input },
+    );
+  }
+
+  async projectShareAccess(orgId: string, projectId: string) {
+    return this.request<{ access: CloudProjectShareAccess }>(
+      this.orgPath(orgId, `/projects/${encodeURIComponent(projectId)}/shares`),
+    );
+  }
+
+  async updateProjectShareGrant(
+    orgId: string,
+    projectId: string,
+    grantId: string,
+    input: { role: "viewer" | "editor" },
+  ) {
+    return this.request<{ grant: CloudProjectShareGrant }>(
+      this.orgPath(
+        orgId,
+        `/projects/${encodeURIComponent(projectId)}/shares/grants/${encodeURIComponent(grantId)}`,
+      ),
+      { method: "PATCH", body: input },
+    );
+  }
+
+  async revokeProjectShareGrant(
+    orgId: string,
+    projectId: string,
+    grantId: string,
+  ) {
+    return this.request<void>(
+      this.orgPath(
+        orgId,
+        `/projects/${encodeURIComponent(projectId)}/shares/grants/${encodeURIComponent(grantId)}`,
+      ),
+      { method: "DELETE" },
+    );
+  }
+
+  async revokeProjectShareLink(orgId: string, projectId: string, linkId: string) {
+    return this.request<void>(
+      this.orgPath(
+        orgId,
+        `/projects/${encodeURIComponent(projectId)}/shares/links/${encodeURIComponent(linkId)}`,
+      ),
+      { method: "DELETE" },
+    );
+  }
+
+  async redeemProjectShareLink(token: string) {
+    return this.request<{ share: CloudSharedProject }>(
+      `/api/cloud/v1/share-links/${encodeURIComponent(token)}/redeem`,
+      { method: "POST", body: {} },
+    );
+  }
+
+  async sharedProjects() {
+    return this.request<{ shares: CloudSharedProject[] }>("/api/cloud/v1/shares");
+  }
+
+  async sessions(orgId: string) {
+    return this.request<{ sessions: CloudSession[] }>(
+      this.orgPath(orgId, "/sessions"),
+    );
+  }
+
+  async session(orgId: string, sessionId: string) {
+    return this.request<{ session: CloudSession }>(
+      this.orgPath(orgId, `/sessions/${encodeURIComponent(sessionId)}`),
+    );
+  }
+
+  async activeTurn(orgId: string, sessionId: string) {
+    return this.request<{ turn: CloudTurn | null }>(
+      this.orgPath(orgId, `/sessions/${encodeURIComponent(sessionId)}/active-turn`),
+    );
+  }
+
+  async sessionSCM(orgId: string, sessionId: string) {
     return this.request<{ scm: CloudSessionSCM | null }>(
-      `/api/cloud/v1/sessions/${encodeURIComponent(sessionId)}/scm`,
+      this.orgPath(orgId, `/sessions/${encodeURIComponent(sessionId)}/scm`),
     );
   }
 
   async createSession(
+    orgId: string,
     input: {
       projectId: string;
       kind: CloudSession["kind"];
@@ -267,7 +653,7 @@ export class CloudAPI {
     },
     idempotencyKey: string,
   ) {
-    return this.request<{ session: CloudSession }>("/api/cloud/v1/sessions", {
+    return this.request<{ session: CloudSession }>(this.orgPath(orgId, "/sessions"), {
       method: "POST",
       headers: { "Idempotency-Key": idempotencyKey },
       body: input,
@@ -275,24 +661,32 @@ export class CloudAPI {
   }
 
   async setDesiredState(
+    orgId: string,
     sessionId: string,
     state: "running" | "paused" | "deleted",
   ) {
     return this.request<{ ok: boolean; state: string }>(
-      `/api/cloud/v1/sessions/${encodeURIComponent(sessionId)}/desired-state`,
+      this.orgPath(orgId, `/sessions/${encodeURIComponent(sessionId)}/desired-state`),
       { method: "POST", body: { state } },
     );
   }
 
-  async chatEvents(sessionId: string, after = 0, limit = 500) {
-    return this.request<{ events: CloudEvent[] }>(
-      `/api/cloud/v1/sessions/${encodeURIComponent(sessionId)}/chat-events?after=${after}&limit=${limit}`,
+  async deleteSession(orgId: string, sessionId: string) {
+    return this.request<void>(
+      this.orgPath(orgId, `/sessions/${encodeURIComponent(sessionId)}`),
+      { method: "DELETE" },
     );
   }
 
-  async sendMessage(sessionId: string, text: string, idempotencyKey: string) {
+  async chatEvents(orgId: string, sessionId: string, after = 0, limit = 500) {
+    return this.request<{ events: CloudEvent[] }>(
+      this.orgPath(orgId, `/sessions/${encodeURIComponent(sessionId)}/chat-events?after=${after}&limit=${limit}`),
+    );
+  }
+
+  async sendMessage(orgId: string, sessionId: string, text: string, idempotencyKey: string) {
     return this.request<{ event: CloudEvent }>(
-      `/api/cloud/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
+      this.orgPath(orgId, `/sessions/${encodeURIComponent(sessionId)}/messages`),
       {
         method: "POST",
         headers: { "Idempotency-Key": idempotencyKey },
@@ -301,14 +695,15 @@ export class CloudAPI {
     );
   }
 
-  async interruptSession(sessionId: string) {
+  async interruptSession(orgId: string, sessionId: string) {
     return this.request<{ event: CloudEvent }>(
-      `/api/cloud/v1/sessions/${encodeURIComponent(sessionId)}/interrupt`,
+      this.orgPath(orgId, `/sessions/${encodeURIComponent(sessionId)}/interrupt`),
       { method: "POST", body: {} },
     );
   }
 
   async streamEvents(
+    orgId: string,
     sessionId: string,
     after: number,
     signal: AbortSignal,
@@ -316,7 +711,7 @@ export class CloudAPI {
     onActivity?: () => void,
   ) {
     const target = new URL(
-      `/api/cloud/v1/sessions/${encodeURIComponent(sessionId)}/events`,
+      this.orgPath(orgId, `/sessions/${encodeURIComponent(sessionId)}/events`),
       this.baseURL,
     );
     target.searchParams.set("after", String(after));
@@ -370,47 +765,65 @@ export class CloudAPI {
     }
   }
 
-  async providerConnections() {
-    return this.request<{ providerConnections: ProviderConnection[] }>(
-      "/api/cloud/v1/provider-connections",
+  async providerConnections(orgId: string) {
+    return this.request<{
+      providerConnections: ProviderConnection[];
+      agentCredentialsMode: AgentCredentialsMode;
+    }>(
+      this.orgPath(orgId, "/provider-connections"),
     );
   }
 
-  async connectDaytona(input: {
+  async updateProviderSettings(
+    orgId: string,
+    input: { agentCredentialsMode: AgentCredentialsMode },
+  ) {
+    return this.request<{
+      agentCredentialsMode: AgentCredentialsMode;
+      providerConnections: ProviderConnection[];
+    }>(this.orgPath(orgId, "/provider-settings"), {
+      method: "PATCH",
+      body: input,
+    });
+  }
+
+  async connectDaytona(orgId: string, input: {
     label: string;
     apiKey: string;
     apiUrl: string;
     target: "us" | "eu";
   }) {
     return this.request<{ providerConnection: ProviderConnection }>(
-      "/api/cloud/v1/provider-connections/daytona",
+      this.orgPath(orgId, "/provider-connections/daytona"),
       { method: "PUT", body: input },
     );
   }
 
   async connectAgent(
+    orgId: string,
     agent: CloudAgent,
     input: { credentialType: AgentCredentialType; secret: string },
   ) {
     return this.request<{ providerConnection: ProviderConnection }>(
-      `/api/cloud/v1/provider-connections/agents/${encodeURIComponent(agent)}`,
+      this.orgPath(orgId, `/provider-connections/agents/${encodeURIComponent(agent)}`),
       { method: "PUT", body: input },
     );
   }
 
-  async disconnectAgent(agent: CloudAgent) {
+  async disconnectAgent(orgId: string, agent: CloudAgent) {
     return this.request<void>(
-      `/api/cloud/v1/provider-connections/agents/${encodeURIComponent(agent)}`,
+      this.orgPath(orgId, `/provider-connections/agents/${encodeURIComponent(agent)}`),
       { method: "DELETE" },
     );
   }
 
   async terminalTicket(
+    orgId: string,
     sessionId: string,
     kind: "agent" | "workspace" = "agent",
   ) {
-    return this.request<{ ticket: string; expiresIn: number }>(
-      `/api/cloud/v1/sessions/${encodeURIComponent(sessionId)}/terminal-ticket`,
+    return this.request<{ ticket: string; expiresIn: number; scopes?: string[] }>(
+      this.orgPath(orgId, `/sessions/${encodeURIComponent(sessionId)}/terminal-ticket`),
       { method: "POST", body: { kind } },
     );
   }
@@ -428,45 +841,49 @@ export class CloudAPI {
     return target.toString();
   }
 
-  async workspaceFiles(sessionId: string, path = "") {
+  async workspaceFiles(orgId: string, sessionId: string, path = "") {
     const query = new URLSearchParams({ path });
     return this.request<{ path: string; entries: CloudWorkspaceEntry[] }>(
-      `/api/cloud/v1/sessions/${encodeURIComponent(sessionId)}/workspace/files?${query}`,
+      this.orgPath(orgId, `/sessions/${encodeURIComponent(sessionId)}/workspace/files?${query}`),
     );
   }
 
-  async workspaceFile(sessionId: string, path: string) {
+  async workspaceFile(orgId: string, sessionId: string, path: string) {
     const query = new URLSearchParams({ path });
     return this.request<{ path: string; content: string; size: number }>(
-      `/api/cloud/v1/sessions/${encodeURIComponent(sessionId)}/workspace/file?${query}`,
+      this.orgPath(orgId, `/sessions/${encodeURIComponent(sessionId)}/workspace/file?${query}`),
     );
   }
 
-  async workspaceDiff(sessionId: string) {
+  async workspaceDiff(orgId: string, sessionId: string) {
     return this.request<CloudWorkspaceDiff>(
-      `/api/cloud/v1/sessions/${encodeURIComponent(sessionId)}/workspace/diff`,
+      this.orgPath(orgId, `/sessions/${encodeURIComponent(sessionId)}/workspace/diff`),
     );
   }
 
-  async workspacePreview(sessionId: string, port: number, path: string) {
+  async workspacePreview(orgId: string, sessionId: string, port: number, path: string) {
     return this.request<CloudPreviewResponse>(
-      `/api/cloud/v1/sessions/${encodeURIComponent(sessionId)}/workspace/preview`,
+      this.orgPath(orgId, `/sessions/${encodeURIComponent(sessionId)}/workspace/preview`),
       { method: "POST", body: { port, path, method: "GET" } },
     );
   }
 
-  async workspacePreviewTicket(sessionId: string, port: number) {
+  async workspacePreviewTicket(orgId: string, sessionId: string, port: number) {
     return this.request<{ url: string; expiresAt: string }>(
-      `/api/cloud/v1/sessions/${encodeURIComponent(sessionId)}/workspace/preview-ticket`,
+      this.orgPath(orgId, `/sessions/${encodeURIComponent(sessionId)}/workspace/preview-ticket`),
       { method: "POST", body: { port } },
     );
   }
 
-  async workspaceFilePreviewTicket(sessionId: string, path: string) {
+  async workspaceFilePreviewTicket(orgId: string, sessionId: string, path: string) {
     return this.request<{ url: string; expiresAt: string }>(
-      `/api/cloud/v1/sessions/${encodeURIComponent(sessionId)}/workspace/file-preview-ticket`,
+      this.orgPath(orgId, `/sessions/${encodeURIComponent(sessionId)}/workspace/file-preview-ticket`),
       { method: "POST", body: { path } },
     );
+  }
+
+  private orgPath(orgId: string, path: string) {
+    return `/api/cloud/v1/orgs/${encodeURIComponent(orgId)}${path}`;
   }
 
   private async request<T>(
@@ -488,9 +905,11 @@ export class CloudAPI {
         message?: string;
         code?: string;
       } | null;
-      throw new Error(
+      throw new CloudAPIError(
         failure?.message ??
           `AO Cloud request failed (${failure?.code ?? response.status}).`,
+        response.status,
+        failure?.code,
       );
     }
     if (response.status === 204) return undefined as T;

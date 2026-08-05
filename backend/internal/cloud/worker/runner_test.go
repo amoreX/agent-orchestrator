@@ -6,7 +6,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,9 +17,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/coder/websocket"
+	"github.com/creack/pty"
 
 	clouddomain "github.com/aoagents/agent-orchestrator/backend/internal/cloud/domain"
 	cloudpostgres "github.com/aoagents/agent-orchestrator/backend/internal/cloud/postgres"
+	cloudworkerhub "github.com/aoagents/agent-orchestrator/backend/internal/cloud/workerhub"
 	shareddomain "github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
@@ -204,6 +212,506 @@ func TestRegressionSpawnedClaudePromptIsSubmittedAfterComposerUpdate(t *testing.
 	}
 }
 
+func TestClaudeTerminalReadyWaitsForComposerFooter(t *testing.T) {
+	ready := newAgentTerminalReady("claude-code")
+	ready.observe([]byte("Welcome back!"))
+	select {
+	case <-ready.ready:
+		t.Fatal("Claude terminal marked ready before composer footer")
+	default:
+	}
+
+	ready.observe([]byte("bypass permissions on (shift+tab to cycle)"))
+	if err := ready.wait(context.Background()); err != nil {
+		t.Fatalf("wait() error = %v", err)
+	}
+}
+
+func TestNonClaudeTerminalReadyImmediately(t *testing.T) {
+	ready := newAgentTerminalReady("codex")
+	if err := ready.wait(context.Background()); err != nil {
+		t.Fatalf("wait() error = %v", err)
+	}
+}
+
+func TestClaudeTerminalReadyToleratesStyledComposerFooter(t *testing.T) {
+	separators := map[string]string{
+		"space":                 " ",
+		"mixed whitespace":      "\t\r\n\u00a0",
+		"style reset":           "\x1b[2m\x1b[0m",
+		"cursor positioning":    "\x1b[13G",
+		"OSC title":             "\x1b]0;temporary title\a",
+		"OSC string terminator": "\x1b]0;temporary title\x1b\\",
+	}
+	for name, separator := range separators {
+		t.Run(name+"/permission-mode", func(t *testing.T) {
+			if !claudeTerminalReady("BYPASS" + separator + "permissions on") {
+				t.Fatal("Claude permission-mode footer was not detected")
+			}
+		})
+		t.Run(name+"/keyboard-hint", func(t *testing.T) {
+			output := "shift" + separator + "+" + separator + "tab" +
+				separator + "to" + separator + "cycle"
+			if !claudeTerminalReady(output) {
+				t.Fatal("Claude keyboard hint was not detected")
+			}
+		})
+	}
+}
+
+func TestClaudeTerminalReadyRejectsUnrelatedStartupText(t *testing.T) {
+	for _, output := range []string{
+		"Welcome back!",
+		"permissions",
+		"shift tab",
+		"Fixed PreToolUse auto-allow hooks bypassing too broadly",
+		"\x1b]0;Claude Code\a",
+	} {
+		if claudeTerminalReady(output) {
+			t.Fatalf("unrelated output marked Claude ready: %q", output)
+		}
+	}
+}
+
+func TestClaudeTerminalReadyToleratesMixedKeyboardHintSeparators(t *testing.T) {
+	separators := []string{
+		"",
+		" ",
+		"\t\r\n\u00a0",
+		"\x1b[13G",
+		"\x1b[2m\x1b[0m",
+		"\x1b]0;temporary title\a",
+		"\x1bPtemporary device string\x1b\\",
+	}
+	for firstIndex, first := range separators {
+		for secondIndex, second := range separators {
+			for thirdIndex, third := range separators {
+				for fourthIndex, fourth := range separators {
+					output := "shift" + first + "+" + second + "tab" +
+						third + "to" + fourth + "cycle"
+					if !claudeTerminalReady(output) {
+						t.Fatalf(
+							"mixed separators [%d,%d,%d,%d] were not detected",
+							firstIndex,
+							secondIndex,
+							thirdIndex,
+							fourthIndex,
+						)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestClaudeTerminalReadyMatchesClaude221CursorPositionedFixture(t *testing.T) {
+	fixture := readClaudeComposerFixture(t)
+	if fixture.Version != "2.1.221" || fixture.TerminalColumns != 80 {
+		t.Fatalf("fixture metadata = %#v", fixture)
+	}
+
+	ready := newAgentTerminalReady("claude-code")
+	for index, chunk := range fixture.Chunks {
+		ready.observe([]byte(chunk))
+		if index < 4 {
+			select {
+			case <-ready.ready:
+				t.Fatalf("Claude marked ready before composer chunk %d", index)
+			default:
+			}
+		}
+	}
+	if err := ready.wait(context.Background()); err != nil {
+		t.Fatalf("wait() error = %v", err)
+	}
+
+	compact := compactTerminalText(strings.Join(fixture.Chunks, ""))
+	if !strings.Contains(compact, "bypasspermissionsonshifttabtocycle") {
+		t.Fatalf("normalized fixture does not contain composer marker: %q", compact)
+	}
+}
+
+func TestClaudeTerminalReadyHandlesEveryChunkBoundaryInFixture(t *testing.T) {
+	fixture := readClaudeComposerFixture(t)
+	output := strings.Join(fixture.Chunks, "")
+	for split := 1; split < len(output); split++ {
+		ready := newAgentTerminalReady("claude-code")
+		ready.observe([]byte(output[:split]))
+		ready.observe([]byte(output[split:]))
+		select {
+		case <-ready.ready:
+		default:
+			t.Fatalf("Claude fixture was not detected at byte split %d", split)
+		}
+	}
+
+	bytewise := newAgentTerminalReady("claude-code")
+	for index := range len(output) {
+		bytewise.observe([]byte(output[index : index+1]))
+	}
+	if err := bytewise.wait(context.Background()); err != nil {
+		t.Fatalf("bytewise fixture wait() error = %v", err)
+	}
+}
+
+func TestClaudeTerminalReadyRetainsComposerMarkerAfterBufferTruncation(t *testing.T) {
+	ready := newAgentTerminalReady("claude-code")
+	ready.observe([]byte(strings.Repeat("unrelated startup output ", 600)))
+	ready.observe([]byte("\x1b[6Gbypass\x1b[13Gpermissions"))
+	if err := ready.wait(context.Background()); err != nil {
+		t.Fatalf("wait() error = %v", err)
+	}
+}
+
+func TestClaudePromptCanWaitForComposerBeforeActivityHook(t *testing.T) {
+	if !promptDeliveryCanWaitForTerminal(false, newAgentTerminalReady("claude-code")) {
+		t.Fatal("Claude prompt remained dependent on the activity hook")
+	}
+	if promptDeliveryCanWaitForTerminal(false, newAgentTerminalReady("codex")) {
+		t.Fatal("non-Claude prompt bypassed the activity hook")
+	}
+	if !promptDeliveryCanWaitForTerminal(true, newAgentTerminalReady("codex")) {
+		t.Fatal("ready non-Claude agent could not receive its prompt")
+	}
+}
+
+func TestClaudePromptPrecedesBrowserCommandsDuringStartup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	terminal, agentSide, err := pty.Open()
+	if err != nil {
+		t.Fatalf("pty.Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = terminal.Close()
+		_ = agentSide.Close()
+	})
+
+	promptAccepted := make(chan struct{})
+	commandsSent := make(chan struct{})
+	serverErrors := make(chan error, 1)
+	var acceptedOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/cloud/v1/worker/connect":
+			socket, acceptErr := websocket.Accept(w, r, nil)
+			if acceptErr != nil {
+				serverErrors <- acceptErr
+				return
+			}
+			defer socket.Close(websocket.StatusNormalClosure, "test complete")
+			commands := []cloudworkerhub.Command{
+				{
+					Type:     "prompt",
+					Sequence: 1,
+					Data:     base64.StdEncoding.EncodeToString([]byte("startup task")),
+				},
+				{Type: "resize", Rows: 40, Cols: 120},
+				{
+					Type: "input",
+					Data: base64.StdEncoding.EncodeToString([]byte("premature browser input\r")),
+				},
+				{Type: "agent_ready"},
+				{
+					Type: "input",
+					Data: base64.StdEncoding.EncodeToString([]byte("accepted browser input\r")),
+				},
+			}
+			for _, command := range commands {
+				encoded, marshalErr := json.Marshal(command)
+				if marshalErr != nil {
+					serverErrors <- marshalErr
+					return
+				}
+				if writeErr := socket.Write(r.Context(), websocket.MessageText, encoded); writeErr != nil {
+					serverErrors <- writeErr
+					return
+				}
+			}
+			close(commandsSent)
+			<-r.Context().Done()
+		case "/api/cloud/v1/worker/events":
+			var event struct {
+				Type string `json:"type"`
+			}
+			if decodeErr := json.NewDecoder(r.Body).Decode(&event); decodeErr != nil {
+				serverErrors <- decodeErr
+				http.Error(w, decodeErr.Error(), http.StatusBadRequest)
+				return
+			}
+			if event.Type == "worker.prompt_accepted" {
+				acceptedOnce.Do(func() { close(promptAccepted) })
+			}
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(server.URL, server.Client())
+	client.acceptToken("worker-token")
+	runner := &Runner{client: client}
+	terminalReady := newAgentTerminalReady("claude-code")
+	var writeMu sync.Mutex
+	var workspaceWriteMu sync.Mutex
+	go runner.commandLoop(
+		ctx,
+		terminal,
+		terminalReady,
+		terminal,
+		&writeMu,
+		&workspaceWriteMu,
+		0,
+	)
+
+	select {
+	case <-commandsSent:
+	case err := <-serverErrors:
+		t.Fatalf("send startup commands: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("startup commands were not sent")
+	}
+	select {
+	case <-promptAccepted:
+		t.Fatal("prompt was accepted before Claude rendered its composer")
+	case err := <-serverErrors:
+		t.Fatalf("startup command stream error: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	for _, chunk := range readClaudeComposerFixture(t).Chunks {
+		terminalReady.observe([]byte(chunk))
+	}
+
+	select {
+	case <-promptAccepted:
+	case err := <-serverErrors:
+		t.Fatalf("accept startup prompt: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Claude 2.1.221 composer did not release the startup prompt")
+	}
+
+	terminalInput := make(chan string, 1)
+	go func() {
+		var received strings.Builder
+		buffer := make([]byte, 256)
+		for !strings.Contains(received.String(), "accepted browser input") {
+			count, readErr := agentSide.Read(buffer)
+			if readErr != nil {
+				return
+			}
+			received.Write(buffer[:count])
+		}
+		terminalInput <- received.String()
+	}()
+	select {
+	case received := <-terminalInput:
+		if !strings.Contains(received, "startup task") {
+			t.Fatalf("terminal input %q does not contain startup prompt", received)
+		}
+		if strings.Contains(received, "premature browser input") {
+			t.Fatalf("browser input interrupted startup: %q", received)
+		}
+	case err := <-serverErrors:
+		t.Fatalf("process startup commands: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("browser input was not restored after startup prompt")
+	}
+}
+
+func TestFollowUpPromptRunsAfterCommandDeliveredStartupPrompt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	terminal, agentSide, err := pty.Open()
+	if err != nil {
+		t.Fatalf("pty.Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = terminal.Close()
+		_ = agentSide.Close()
+	})
+
+	const startupSequence = int64(2)
+	const followUpSequence = int64(4)
+	promptAccepted := make(chan int64, 1)
+	commandsSent := make(chan struct{})
+	serverErrors := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/cloud/v1/worker/connect":
+			if got := r.URL.Query().Get("after"); got != "2" {
+				serverErrors <- fmt.Errorf("after = %q, want 2", got)
+				http.Error(w, "invalid after", http.StatusBadRequest)
+				return
+			}
+			if got := r.URL.Query().Get("commandPrompt"); got != "2" {
+				serverErrors <- fmt.Errorf("commandPrompt = %q, want 2", got)
+				http.Error(w, "invalid command prompt", http.StatusBadRequest)
+				return
+			}
+			socket, acceptErr := websocket.Accept(w, r, nil)
+			if acceptErr != nil {
+				serverErrors <- acceptErr
+				return
+			}
+			defer socket.Close(websocket.StatusNormalClosure, "test complete")
+			for _, command := range []cloudworkerhub.Command{
+				{Type: "agent_ready"},
+				{
+					Type:     "prompt",
+					Sequence: startupSequence,
+					Data: base64.StdEncoding.EncodeToString(
+						[]byte("duplicated startup prompt"),
+					),
+				},
+				{
+					Type:     "prompt",
+					Sequence: followUpSequence,
+					Data: base64.StdEncoding.EncodeToString(
+						[]byte("orchestrator follow-up"),
+					),
+				},
+			} {
+				encoded, marshalErr := json.Marshal(command)
+				if marshalErr != nil {
+					serverErrors <- marshalErr
+					return
+				}
+				if writeErr := socket.Write(
+					r.Context(),
+					websocket.MessageText,
+					encoded,
+				); writeErr != nil {
+					serverErrors <- writeErr
+					return
+				}
+			}
+			close(commandsSent)
+			<-r.Context().Done()
+		case "/api/cloud/v1/worker/events":
+			var event struct {
+				Type    string `json:"type"`
+				Payload struct {
+					Sequence int64 `json:"sequence"`
+				} `json:"payload"`
+			}
+			if decodeErr := json.NewDecoder(r.Body).Decode(&event); decodeErr != nil {
+				serverErrors <- decodeErr
+				http.Error(w, decodeErr.Error(), http.StatusBadRequest)
+				return
+			}
+			if event.Type == "worker.prompt_accepted" {
+				promptAccepted <- event.Payload.Sequence
+			}
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewClient(server.URL, server.Client())
+	client.acceptToken("worker-token")
+	runner := &Runner{client: client}
+	terminalReady := newAgentTerminalReady("claude-code")
+	var writeMu sync.Mutex
+	var workspaceWriteMu sync.Mutex
+	go runner.commandLoop(
+		ctx,
+		terminal,
+		terminalReady,
+		terminal,
+		&writeMu,
+		&workspaceWriteMu,
+		startupSequence,
+	)
+
+	select {
+	case <-commandsSent:
+	case err := <-serverErrors:
+		t.Fatalf("send follow-up commands: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("follow-up commands were not sent")
+	}
+	select {
+	case sequence := <-promptAccepted:
+		t.Fatalf("prompt sequence %d accepted before Claude was ready", sequence)
+	case err := <-serverErrors:
+		t.Fatalf("follow-up command stream error: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	for _, chunk := range readClaudeComposerFixture(t).Chunks {
+		terminalReady.observe([]byte(chunk))
+	}
+
+	select {
+	case sequence := <-promptAccepted:
+		if sequence != followUpSequence {
+			t.Fatalf("accepted prompt sequence = %d, want %d", sequence, followUpSequence)
+		}
+	case err := <-serverErrors:
+		t.Fatalf("accept follow-up prompt: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("follow-up prompt was not acknowledged")
+	}
+
+	terminalInput := make(chan string, 1)
+	go func() {
+		buffer := make([]byte, 256)
+		count, readErr := agentSide.Read(buffer)
+		if readErr == nil {
+			terminalInput <- string(buffer[:count])
+		}
+	}()
+	select {
+	case received := <-terminalInput:
+		if !strings.Contains(received, "orchestrator follow-up") {
+			t.Fatalf("terminal input %q does not contain follow-up prompt", received)
+		}
+		if strings.Contains(received, "duplicated startup prompt") {
+			t.Fatalf("terminal input duplicated startup prompt: %q", received)
+		}
+	case err := <-serverErrors:
+		t.Fatalf("read follow-up terminal input: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("follow-up prompt was not written to the terminal")
+	}
+}
+
+type claudeComposerFixture struct {
+	Version         string   `json:"version"`
+	TerminalColumns int      `json:"terminalColumns"`
+	Chunks          []string `json:"chunks"`
+}
+
+func readClaudeComposerFixture(t *testing.T) claudeComposerFixture {
+	t.Helper()
+	contents, err := os.ReadFile(filepath.Join("testdata", "claude-2.1.221-composer.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture claudeComposerFixture
+	if err := json.Unmarshal(contents, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	if len(fixture.Chunks) == 0 {
+		t.Fatal("Claude composer fixture has no chunks")
+	}
+	return fixture
+}
+
+func TestTerminalInputAllowedAfterAgentReady(t *testing.T) {
+	if terminalInputAllowed(false) {
+		t.Fatal("terminal input allowed before agent readiness")
+	}
+	if !terminalInputAllowed(true) {
+		t.Fatal("terminal input blocked after agent readiness")
+	}
+}
+
 func TestStreamOutputRetriesWithoutStoppingPTYDrain(t *testing.T) {
 	calls := 0
 	runner := &Runner{
@@ -325,6 +833,202 @@ func TestLocalGitHubCredentialPersistsAndConfiguresGit(t *testing.T) {
 	}
 }
 
+func TestWorkerGitCredentialHelperUsesCurrentTokenWithoutEmbeddingIt(t *testing.T) {
+	dataDir := t.TempDir()
+	tokenPath := filepath.Join(dataDir, "worker-token")
+	if err := os.WriteFile(tokenPath, []byte("initial-worker-token"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{dataDir: dataDir}
+	helperPath, err := runner.prepareWorkerGitCredentialHelper()
+	if err != nil {
+		t.Fatalf("prepareWorkerGitCredentialHelper() error = %v", err)
+	}
+
+	helperInfo, err := os.Stat(helperPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if helperInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("helper mode = %o, want 700", helperInfo.Mode().Perm())
+	}
+	tokenInfo, err := os.Stat(tokenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tokenInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("token mode = %o, want 600", tokenInfo.Mode().Perm())
+	}
+	helperContents, err := os.ReadFile(helperPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(helperContents), "initial-worker-token") {
+		t.Fatal("credential helper embedded the worker token")
+	}
+	assertWorkerGitCredential(t, helperPath, "initial-worker-token")
+
+	if err := os.WriteFile(tokenPath, []byte("heartbeat-refreshed-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertWorkerGitCredential(t, helperPath, "heartbeat-refreshed-token")
+	if strings.Contains(string(helperContents), "heartbeat-refreshed-token") {
+		t.Fatal("credential helper embedded the refreshed worker token")
+	}
+}
+
+func TestPrepareRepositoryConfiguresWorkerCredentialForNewAndResumedWorkspace(t *testing.T) {
+	root := t.TempDir()
+	sourceDir := filepath.Join(root, "source")
+	remoteDir := filepath.Join(
+		root,
+		"api",
+		"cloud",
+		"v1",
+		"git",
+		"example",
+		"repository.git",
+	)
+	if err := os.MkdirAll(sourceDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, sourceDir, nil, "init", "-b", "main")
+	runGitTestCommand(t, sourceDir, nil, "config", "user.email", "worker@example.test")
+	runGitTestCommand(t, sourceDir, nil, "config", "user.name", "AO Worker")
+	if err := os.WriteFile(filepath.Join(sourceDir, "README.md"), []byte("fixture\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, sourceDir, nil, "add", "README.md")
+	runGitTestCommand(t, sourceDir, nil, "commit", "-m", "fixture")
+	if err := os.MkdirAll(filepath.Dir(remoteDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, root, nil, "clone", "--bare", sourceDir, remoteDir)
+
+	dataDir := filepath.Join(root, "worker-data")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "worker-token"), []byte("worker-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AO_CLOUD_PUBLIC_URL", "file://"+root)
+	workspaceDir := filepath.Join(root, "workspace")
+	client := NewClient("http://127.0.0.1:1", nil)
+	client.SetToken("worker-token")
+	runner := &Runner{
+		client:       client,
+		workspaceDir: workspaceDir,
+		dataDir:      dataDir,
+		bootstrap: BootstrapResponse{
+			Launch: cloudpostgres.WorkerLaunchSpec{
+				RepositoryURL: "https://github.com/example/repository",
+				DefaultBranch: "main",
+				Session: clouddomain.Session{
+					Branch: "ao/session",
+				},
+			},
+		},
+	}
+
+	if err := runner.prepareRepository(context.Background()); err != nil {
+		t.Fatalf("prepareRepository(new) error = %v", err)
+	}
+	assertWorkerGitRepositoryConfig(
+		t,
+		workspaceDir,
+		filepath.Join(dataDir, "git-credential-worker"),
+		"worker-token",
+	)
+
+	if err := runner.prepareRepository(context.Background()); err != nil {
+		t.Fatalf("prepareRepository(resumed) error = %v", err)
+	}
+	assertWorkerGitRepositoryConfig(
+		t,
+		workspaceDir,
+		filepath.Join(dataDir, "git-credential-worker"),
+		"worker-token",
+	)
+}
+
+func assertWorkerGitCredential(t *testing.T, helperPath, token string) {
+	t.Helper()
+	command := exec.Command(helperPath, "get")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run worker Git credential helper: %v: %s", err, output)
+	}
+	credential := string(output)
+	if !strings.Contains(credential, "username="+GitProxyUsername+"\n") ||
+		!strings.Contains(credential, "password="+token+"\n") {
+		t.Fatalf("credential output = %q", credential)
+	}
+}
+
+func assertWorkerGitRepositoryConfig(t *testing.T, workspaceDir, helperPath, token string) {
+	t.Helper()
+	helpers := string(runGitTestCommand(
+		t,
+		workspaceDir,
+		nil,
+		"config",
+		"--local",
+		"--get-all",
+		"credential.helper",
+	))
+	if !strings.Contains(helpers, helperPath) {
+		t.Fatalf("credential helpers = %q, want %q", helpers, helperPath)
+	}
+	useHTTPPath := strings.TrimSpace(string(runGitTestCommand(
+		t,
+		workspaceDir,
+		nil,
+		"config",
+		"--local",
+		"--get",
+		"credential.useHttpPath",
+	)))
+	if useHTTPPath != "true" {
+		t.Fatalf("credential.useHttpPath = %q, want true", useHTTPPath)
+	}
+	authorName := strings.TrimSpace(string(runGitTestCommand(
+		t,
+		workspaceDir,
+		nil,
+		"config",
+		"--local",
+		"--get",
+		"user.name",
+	)))
+	if authorName != cloudGitAuthorName {
+		t.Fatalf("user.name = %q, want %q", authorName, cloudGitAuthorName)
+	}
+	authorEmail := strings.TrimSpace(string(runGitTestCommand(
+		t,
+		workspaceDir,
+		nil,
+		"config",
+		"--local",
+		"--get",
+		"user.email",
+	)))
+	if authorEmail != cloudGitAuthorEmail {
+		t.Fatalf("user.email = %q, want %q", authorEmail, cloudGitAuthorEmail)
+	}
+	credential := string(runGitTestCommand(
+		t,
+		workspaceDir,
+		[]byte("protocol=https\nhost=cloud.example\npath=api/cloud/v1/git/example/repository.git\n\n"),
+		"credential",
+		"fill",
+	))
+	if !strings.Contains(credential, "username="+GitProxyUsername+"\n") ||
+		!strings.Contains(credential, "password="+token+"\n") {
+		t.Fatalf("repository credential output = %q", credential)
+	}
+}
+
 func runGitTestCommand(
 	t *testing.T,
 	dir string,
@@ -380,12 +1084,86 @@ func TestRegressionRestartedClaudeSessionUsesRestoreCommand(t *testing.T) {
 	}
 }
 
+func TestPrepareCloudPromptDeliveryUsesHarnessCommand(t *testing.T) {
+	agent := &recordingCloudAgentLauncher{
+		strategy: ports.PromptDeliveryInCommand,
+	}
+	config := ports.LaunchConfig{Prompt: "Fix the flaky test"}
+	sequence, err := prepareCloudPromptDelivery(
+		context.Background(),
+		agent,
+		&config,
+		42,
+		false,
+	)
+	if err != nil {
+		t.Fatalf("prepareCloudPromptDelivery() error = %v", err)
+	}
+	if sequence != 42 {
+		t.Fatalf("command prompt sequence = %d, want 42", sequence)
+	}
+	if config.Prompt != "Fix the flaky test" {
+		t.Fatalf("launch prompt = %q", config.Prompt)
+	}
+	if agent.strategyCalls != 1 || agent.strategyConfig.Prompt != config.Prompt {
+		t.Fatalf("strategy calls = %d, config = %#v", agent.strategyCalls, agent.strategyConfig)
+	}
+}
+
+func TestPrepareCloudPromptDeliveryKeepsAfterStartPromptsOutOfArgv(t *testing.T) {
+	agent := &recordingCloudAgentLauncher{
+		strategy: ports.PromptDeliveryAfterStart,
+	}
+	config := ports.LaunchConfig{Prompt: "Inject after startup"}
+	sequence, err := prepareCloudPromptDelivery(
+		context.Background(),
+		agent,
+		&config,
+		17,
+		false,
+	)
+	if err != nil {
+		t.Fatalf("prepareCloudPromptDelivery() error = %v", err)
+	}
+	if sequence != 0 || config.Prompt != "" {
+		t.Fatalf("after-start result = (%d, %q), want (0, empty)", sequence, config.Prompt)
+	}
+}
+
+func TestPrepareCloudPromptDeliveryDoesNotReplayPromptInRestoreCommand(t *testing.T) {
+	agent := &recordingCloudAgentLauncher{
+		strategy: ports.PromptDeliveryInCommand,
+	}
+	config := ports.LaunchConfig{Prompt: "Do not duplicate me"}
+	sequence, err := prepareCloudPromptDelivery(
+		context.Background(),
+		agent,
+		&config,
+		29,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("prepareCloudPromptDelivery() error = %v", err)
+	}
+	if sequence != 0 || config.Prompt != "" || agent.strategyCalls != 0 {
+		t.Fatalf(
+			"restore result = (%d, %q), strategy calls = %d",
+			sequence,
+			config.Prompt,
+			agent.strategyCalls,
+		)
+	}
+}
+
 type recordingCloudAgentLauncher struct {
-	launch        []string
-	restore       []string
-	restoreOK     bool
-	launchCalls   int
-	restoreConfig ports.RestoreConfig
+	launch         []string
+	restore        []string
+	restoreOK      bool
+	launchCalls    int
+	restoreConfig  ports.RestoreConfig
+	strategy       ports.PromptDeliveryStrategy
+	strategyCalls  int
+	strategyConfig ports.LaunchConfig
 }
 
 func (a *recordingCloudAgentLauncher) GetLaunchCommand(
@@ -394,6 +1172,15 @@ func (a *recordingCloudAgentLauncher) GetLaunchCommand(
 ) ([]string, error) {
 	a.launchCalls++
 	return a.launch, nil
+}
+
+func (a *recordingCloudAgentLauncher) GetPromptDeliveryStrategy(
+	_ context.Context,
+	config ports.LaunchConfig,
+) (ports.PromptDeliveryStrategy, error) {
+	a.strategyCalls++
+	a.strategyConfig = config
+	return a.strategy, nil
 }
 
 func (a *recordingCloudAgentLauncher) GetRestoreCommand(
@@ -424,6 +1211,33 @@ func readJSONObject(t *testing.T, path string) map[string]any {
 		t.Fatalf("Unmarshal(%q) error = %v", path, err)
 	}
 	return object
+}
+
+func TestCloudWorkerEnvironmentsTargetCanonicalGitHubRepository(t *testing.T) {
+	const repositoryURL = "https://github.com/amoreX/flowlens.git"
+	agentEnvironment := workerEnvironment("worker-token", repositoryURL)
+	workspaceEnvironment := workspaceShellEnvironment("ao/readme-tweak", repositoryURL)
+	for name, environment := range map[string]map[string]string{
+		"agent":     agentEnvironment,
+		"workspace": workspaceEnvironment,
+	} {
+		if got := environment["GH_REPO"]; got != "amoreX/flowlens" {
+			t.Fatalf("%s GH_REPO = %q, want amoreX/flowlens", name, got)
+		}
+	}
+	if got := agentEnvironment["AO_WORKER_TOKEN"]; got != "worker-token" {
+		t.Fatalf("agent worker token = %q", got)
+	}
+	if got := workspaceEnvironment["AO_SESSION_BRANCH"]; got != "ao/readme-tweak" {
+		t.Fatalf("workspace branch = %q", got)
+	}
+}
+
+func TestCloudWorkerEnvironmentOmitsInvalidGitHubRepository(t *testing.T) {
+	environment := workerEnvironment("worker-token", "https://example.com/repository")
+	if _, ok := environment["GH_REPO"]; ok {
+		t.Fatalf("invalid repository produced GH_REPO = %q", environment["GH_REPO"])
+	}
 }
 
 func TestPrepareAgentCredentialEnvironment(t *testing.T) {

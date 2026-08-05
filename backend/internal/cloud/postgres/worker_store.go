@@ -12,11 +12,13 @@ import (
 
 // WorkerLaunchSpec contains the durable inputs needed to launch a session worker.
 type WorkerLaunchSpec struct {
-	AccountID     clouddomain.AccountID `json:"accountId"`
-	Session       clouddomain.Session   `json:"session"`
-	RepositoryURL string                `json:"repositoryUrl"`
-	DefaultBranch string                `json:"defaultBranch"`
-	ProjectConfig []byte                `json:"projectConfig"`
+	AccountID             clouddomain.AccountID `json:"accountId"`
+	Session               clouddomain.Session   `json:"session"`
+	RepositoryURL         string                `json:"repositoryUrl"`
+	DefaultBranch         string                `json:"defaultBranch"`
+	ProjectConfig         []byte                `json:"projectConfig"`
+	PendingPromptSequence int64                 `json:"pendingPromptSequence,omitempty"`
+	PendingPrompt         string                `json:"pendingPrompt,omitempty"`
 }
 
 // WorkerLaunchSpec returns launch data for an account-owned session.
@@ -28,9 +30,10 @@ func (s *Store) WorkerLaunchSpec(
 	var spec WorkerLaunchSpec
 	err := s.pool.QueryRow(ctx, `
 		SELECT
-			session.account_id,
+			session.org_id,
 			session.id,
 			session.account_id,
+			session.org_id,
 			session.project_id,
 			session.kind,
 			session.harness,
@@ -44,14 +47,25 @@ func (s *Store) WorkerLaunchSpec(
 			session.updated_at,
 			project.repository_url,
 			project.default_branch,
-			project.config
+			project.config,
+			COALESCE(turn.user_message_sequence, 0),
+			COALESCE(prompt.payload->>'text', '')
 		FROM ao_sessions session
 		JOIN ao_projects project ON project.id = session.project_id
-		WHERE session.account_id = $1 AND session.id = $2
+		LEFT JOIN ao_turns turn
+			ON turn.session_id = session.id
+			AND turn.org_id = session.org_id
+			AND turn.state IN ('queued', 'provisioning', 'running', 'cancel_requested')
+		LEFT JOIN ao_events prompt
+			ON prompt.session_id = session.id
+			AND prompt.org_id = session.org_id
+			AND prompt.sequence = turn.user_message_sequence
+		WHERE session.org_id = $1 AND session.id = $2
 	`, accountID, sessionID).Scan(
 		&spec.AccountID,
 		&spec.Session.ID,
 		&spec.Session.AccountID,
+		&spec.Session.OrgID,
 		&spec.Session.ProjectID,
 		&spec.Session.Kind,
 		&spec.Session.Harness,
@@ -66,6 +80,8 @@ func (s *Store) WorkerLaunchSpec(
 		&spec.RepositoryURL,
 		&spec.DefaultBranch,
 		&spec.ProjectConfig,
+		&spec.PendingPromptSequence,
+		&spec.PendingPrompt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return WorkerLaunchSpec{}, ErrSessionNotFound
@@ -86,7 +102,7 @@ func (s *Store) UpdateSessionActivity(
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE ao_sessions
 		SET activity_state = $3, updated_at = now()
-		WHERE account_id = $1 AND id = $2
+		WHERE org_id = $1 AND id = $2
 	`, accountID, sessionID, state)
 	if err != nil {
 		return fmt.Errorf("update cloud session activity: %w", err)
@@ -110,7 +126,7 @@ func (s *Store) WorkerConnectionCurrent(
 		SELECT EXISTS (
 			SELECT 1
 			FROM ao_worker_connections
-			WHERE account_id = $1
+			WHERE org_id = $1
 				AND session_id = $2
 				AND worker_id = $3
 				AND epoch = $4

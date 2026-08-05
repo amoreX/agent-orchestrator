@@ -10,6 +10,9 @@ import (
 	"syscall"
 	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	awsecs "github.com/aws/aws-sdk-go-v2/service/ecs"
+
 	cloudauth "github.com/aoagents/agent-orchestrator/backend/internal/cloud/auth"
 	cloudconfig "github.com/aoagents/agent-orchestrator/backend/internal/cloud/config"
 	cloudevents "github.com/aoagents/agent-orchestrator/backend/internal/cloud/events"
@@ -19,8 +22,10 @@ import (
 	cloudsandbox "github.com/aoagents/agent-orchestrator/backend/internal/cloud/sandbox"
 	"github.com/aoagents/agent-orchestrator/backend/internal/cloud/sandbox/daytona"
 	clouddocker "github.com/aoagents/agent-orchestrator/backend/internal/cloud/sandbox/docker"
+	cloudecs "github.com/aoagents/agent-orchestrator/backend/internal/cloud/sandbox/ecs"
 	cloudsandboxresolve "github.com/aoagents/agent-orchestrator/backend/internal/cloud/sandboxresolve"
 	cloudscm "github.com/aoagents/agent-orchestrator/backend/internal/cloud/scm"
+	cloudgithubapp "github.com/aoagents/agent-orchestrator/backend/internal/cloud/scm/githubapp"
 	cloudlocalgh "github.com/aoagents/agent-orchestrator/backend/internal/cloud/scm/localgh"
 	cloudsecrets "github.com/aoagents/agent-orchestrator/backend/internal/cloud/secrets"
 	cloudworker "github.com/aoagents/agent-orchestrator/backend/internal/cloud/worker"
@@ -52,21 +57,74 @@ func run(log *slog.Logger) error {
 	defer store.Close()
 
 	eventService := cloudevents.New(store)
-	authenticator := cloudauth.NewLocalAuthenticator(store)
+	var authenticator cloudauth.Authenticator
+	switch cfg.AuthMode {
+	case "workos", "external":
+		authConfig := cloudauth.ExternalJWTConfig{
+			Provider: cfg.AuthProvider,
+			Issuer:   cfg.AuthIssuer,
+			Audience: cfg.AuthAudience,
+			JWKSURL:  cfg.AuthJWKSURL,
+		}
+		if cfg.AuthMode == "workos" {
+			authConfig.ClientID = cfg.AuthAudience
+			authConfig.Audience = ""
+			authConfig.ProfileResolver, err = cloudauth.NewWorkOSProfileResolver(cfg.WorkOSAPIKey, nil)
+			if err != nil {
+				return err
+			}
+		}
+		authenticator, err = cloudauth.NewExternalJWTAuthenticator(authConfig)
+		if err != nil {
+			return err
+		}
+	default:
+		authenticator = cloudauth.NewLocalAuthenticator(store)
+	}
 	workerTokens := cloudworker.NewTokenManager(cfg.WorkerSigningKey)
 	workerHub := cloudworkerhub.New()
+	var githubAppClient *cloudgithubapp.Client
+	if cfg.GitHubAuthMode == "github-app" {
+		githubAppClient, err = cloudgithubapp.New(cloudgithubapp.Config{
+			AppID:         cfg.GitHubAppID,
+			PrivateKeyPEM: cfg.GitHubAppPrivateKeyPEM,
+		})
+		if err != nil {
+			return err
+		}
+	}
 	var localGitHub *cloudlocalgh.Client
-	switch {
-	case cfg.GitHubToken != "":
+	switch cfg.GitHubAuthMode {
+	case "github-app":
 		localGitHub = cloudlocalgh.NewWithTokenSource(
-			cloudlocalgh.StaticTokenSource(cfg.GitHubToken),
+			cloudlocalgh.NewCredentialBroker(store, githubAppClient),
 			nil,
 		)
-	case cfg.AllowLocalGitHub:
-		localGitHub = cloudlocalgh.New(nil)
+	case "local-gh":
+		if cfg.GitHubToken != "" {
+			localGitHub = cloudlocalgh.NewWithTokenSource(
+				cloudlocalgh.StaticTokenSource(cfg.GitHubToken),
+				nil,
+			)
+		} else if cfg.AllowLocalGitHub {
+			localGitHub = cloudlocalgh.New(nil)
+		}
 	}
+	var repositoryRefresh cloudhttp.RepositoryRefresh
 	if localGitHub != nil {
-		scmObserver := cloudscm.New(store, localGitHub, eventService, 30*time.Second, log)
+		observerOptions := make([]cloudscm.ObserverOption, 0, 1)
+		if cfg.GitHubAuthMode == "github-app" {
+			observerOptions = append(observerOptions, cloudscm.WithGitHubAppMode())
+		}
+		scmObserver := cloudscm.New(
+			store,
+			localGitHub,
+			eventService,
+			30*time.Second,
+			log,
+			observerOptions...,
+		)
+		repositoryRefresh = scmObserver.RefreshRepository
 		go func() {
 			if err := scmObserver.Run(ctx); err != nil {
 				log.Error("cloud SCM observer stopped", "err", err)
@@ -86,6 +144,28 @@ func run(log *slog.Logger) error {
 	if cfg.SandboxProvider == "docker" {
 		dockerProvider = clouddocker.New(cfg.DockerWorkerImage)
 	}
+	var ecsProvider cloudsandbox.Provider
+	if cfg.SandboxProvider == "ecs" {
+		loadOptions := []func(*awsconfig.LoadOptions) error{}
+		if cfg.ECSRegion != "" {
+			loadOptions = append(loadOptions, awsconfig.WithRegion(cfg.ECSRegion))
+		}
+		awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOptions...)
+		if err != nil {
+			return err
+		}
+		ecsProvider, err = cloudecs.New(awsecs.NewFromConfig(awsCfg), cloudecs.Config{
+			Cluster:        cfg.ECSCluster,
+			TaskDefinition: cfg.ECSTaskDefinition,
+			ContainerName:  cfg.ECSContainerName,
+			Subnets:        cfg.ECSSubnets,
+			SecurityGroups: cfg.ECSSecurityGroups,
+			AssignPublicIP: cfg.ECSAssignPublicIP,
+		})
+		if err != nil {
+			return err
+		}
+	}
 	providerResolver := cloudsandboxresolve.New(
 		store,
 		secretCipher,
@@ -93,6 +173,7 @@ func run(log *slog.Logger) error {
 		cfg.DaytonaTarget,
 		daytonaProvider,
 		dockerProvider,
+		ecsProvider,
 	)
 	var workerBinary []byte
 	if cfg.WorkerBinaryPath != "" {
@@ -130,8 +211,29 @@ func run(log *slog.Logger) error {
 		workerHub,
 		localGitHub,
 		cfg.WebPublicURL,
+		cfg.AllowExternalSignup,
 		log,
+		cloudhttp.WithGitHubApp(cloudhttp.GitHubAppConfig{
+			Mode:              cfg.GitHubAuthMode,
+			AppID:             cfg.GitHubAppID,
+			ClientID:          cfg.GitHubAppClientID,
+			AppSlug:           cfg.GitHubAppSlug,
+			StateSecret:       []byte(cfg.GitHubAppStateSecret),
+			WebhookSecret:     []byte(cfg.GitHubAppWebhookSecret),
+			Client:            githubAppClient,
+			RepositoryRefresh: repositoryRefresh,
+		}),
+		cloudhttp.WithMaxActiveSandboxesPerOrg(cfg.MaxActiveSandboxesPerOrg),
+		cloudhttp.WithSandboxProviderResolver(providerResolver),
 	)
+	if cfg.GitHubAuthMode == "github-app" {
+		go func() {
+			if err := api.RunGitHubWebhookProcessor(ctx); err != nil {
+				log.Error("GitHub webhook processor stopped", "err", err)
+				stop()
+			}
+		}()
+	}
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           api.Handler(),

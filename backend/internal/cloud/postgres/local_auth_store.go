@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -36,6 +37,18 @@ func (s *Store) CreateLocalUser(
 		}
 		return clouddomain.LocalUser{}, fmt.Errorf("create local user: %w", err)
 	}
+	if _, err := s.EnsureAccount(ctx, user.ID, displayName); err != nil {
+		return clouddomain.LocalUser{}, err
+	}
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE ao_users
+		SET email = $2,
+			display_name = $3,
+			updated_at = now()
+		WHERE id = $1
+	`, user.ID, email, displayName); err != nil {
+		return clouddomain.LocalUser{}, fmt.Errorf("update cloud local user: %w", err)
+	}
 	return user, nil
 }
 
@@ -52,6 +65,61 @@ func (s *Store) LocalUserByEmail(ctx context.Context, email string) (clouddomain
 	}
 	if err != nil {
 		return clouddomain.LocalUser{}, fmt.Errorf("get local user by email: %w", err)
+	}
+	return user, nil
+}
+
+// UpdateUserProfileInput contains editable profile fields.
+type UpdateUserProfileInput struct {
+	DisplayName string
+}
+
+// UpdateUserProfile updates the shared AO user and local-auth profile.
+func (s *Store) UpdateUserProfile(
+	ctx context.Context,
+	userID string,
+	input UpdateUserProfileInput,
+) (clouddomain.User, error) {
+	displayName := strings.TrimSpace(input.DisplayName)
+	if displayName == "" {
+		return clouddomain.User{}, ErrInvalidUserProfile
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return clouddomain.User{}, fmt.Errorf("begin update user profile: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var user clouddomain.User
+	err = tx.QueryRow(ctx, `
+		UPDATE ao_users
+		SET display_name = $2, updated_at = now()
+		WHERE id = $1
+		RETURNING id, auth_provider, external_user_id, email, display_name, created_at, updated_at
+	`, userID, displayName).Scan(
+		&user.ID,
+		&user.AuthProvider,
+		&user.ExternalUserID,
+		&user.Email,
+		&user.DisplayName,
+		&user.CreatedAt,
+		&user.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return clouddomain.User{}, ErrCloudUserNotFound
+	}
+	if err != nil {
+		return clouddomain.User{}, fmt.Errorf("update cloud user profile: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE ao_local_users
+		SET display_name = $2
+		WHERE id = $1
+	`, userID, displayName); err != nil {
+		return clouddomain.User{}, fmt.Errorf("update local user profile: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return clouddomain.User{}, fmt.Errorf("commit update user profile: %w", err)
 	}
 	return user, nil
 }
