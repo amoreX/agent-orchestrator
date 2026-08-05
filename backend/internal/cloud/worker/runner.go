@@ -198,6 +198,79 @@ func promptDeliveryCanWaitForTerminal(
 		(terminalReady != nil && terminalReady.harness == "claude-code")
 }
 
+// sandboxLaunchPolicy is the agent-launch shape derived from a session's
+// capability mode + denied commands. It feeds both the LaunchConfig (CLI flags)
+// and the Claude settings.json the runner writes, so the two stay consistent.
+type sandboxLaunchPolicy struct {
+	permission   ports.PermissionMode
+	allowedTools []string
+	deniedTools  []string
+	settingsMode string // Claude permissions.defaultMode
+}
+
+// readOnlyAllowedTools / readOnlyDeniedTools mirror the reviewer's proven
+// read-only toolset: read + inspect + a few safe bash commands, with the write
+// paths hard-denied. Launched off a non-bypass mode so these rules are honored.
+var readOnlyAllowedTools = []string{
+	"Read", "Grep", "Glob",
+	"Bash(printf:*)", "Bash(gh:*)",
+	"Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git status:*)",
+}
+
+var readOnlyDeniedTools = []string{
+	"Edit", "Write", "NotebookEdit",
+	"Bash(git push:*)", "Bash(git commit:*)",
+}
+
+// deniedCommandTools maps operator-supplied bash patterns onto Claude deny rules.
+// Defense-in-depth, not a wall: an agent can obfuscate or use alternate binaries.
+func deniedCommandTools(patterns []string) []string {
+	out := make([]string, 0, len(patterns))
+	for _, p := range patterns {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, "Bash("+p+")")
+		}
+	}
+	return out
+}
+
+// deriveSandboxLaunchPolicy translates a session's security policy into the
+// permission mode + tool allow/deny lists to launch the agent with. Trusted is
+// unchanged (bypass) unless denied commands are present — deny rules are ignored
+// under bypass, so trusted-with-denials steps down to acceptEdits to keep the
+// bans enforced. An empty/unknown mode is treated as trusted (see
+// clouddomain.NormalizeSandboxMode).
+func deriveSandboxLaunchPolicy(session clouddomain.Session) sandboxLaunchPolicy {
+	denied := deniedCommandTools(session.DeniedCommands)
+	switch clouddomain.NormalizeSandboxMode(session.Mode) {
+	case clouddomain.SandboxModeReadOnly:
+		return sandboxLaunchPolicy{
+			permission:   ports.PermissionModeAuto,
+			allowedTools: readOnlyAllowedTools,
+			deniedTools:  append(append([]string{}, readOnlyDeniedTools...), denied...),
+			settingsMode: "default",
+		}
+	case clouddomain.SandboxModeStandard:
+		return sandboxLaunchPolicy{
+			permission:   ports.PermissionModeAcceptEdits,
+			deniedTools:  denied,
+			settingsMode: "acceptEdits",
+		}
+	default: // trusted
+		if len(denied) > 0 {
+			return sandboxLaunchPolicy{
+				permission:   ports.PermissionModeAcceptEdits,
+				deniedTools:  denied,
+				settingsMode: "acceptEdits",
+			}
+		}
+		return sandboxLaunchPolicy{
+			permission:   ports.PermissionModeBypassPermissions,
+			settingsMode: "bypassPermissions",
+		}
+	}
+}
+
 // NewRunner creates a worker runner from bootstrap launch data.
 func NewRunner(client *Client, bootstrap BootstrapResponse, workspaceDir, dataDir string) *Runner {
 	return &Runner{
@@ -241,12 +314,15 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	policy := deriveSandboxLaunchPolicy(r.bootstrap.Launch.Session)
 	launchConfig := ports.LaunchConfig{
-		DataDir:     r.dataDir,
-		Kind:        shareddomain.SessionKind(r.bootstrap.Launch.Session.Kind),
-		Permissions: ports.PermissionModeBypassPermissions,
-		Prompt:      r.bootstrap.Launch.PendingPrompt,
-		SessionID:   string(r.bootstrap.Launch.Session.ID),
+		DataDir:         r.dataDir,
+		Kind:            shareddomain.SessionKind(r.bootstrap.Launch.Session.Kind),
+		Permissions:     policy.permission,
+		AllowedTools:    policy.allowedTools,
+		DisallowedTools: policy.deniedTools,
+		Prompt:          r.bootstrap.Launch.PendingPrompt,
+		SessionID:       string(r.bootstrap.Launch.Session.ID),
 		SystemPrompt: systemPrompt(
 			r.bootstrap.Launch.Session.Kind,
 			string(r.bootstrap.Launch.Session.ProjectID),
@@ -262,7 +338,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("resolve Claude home: %w", err)
 		}
-		if err := prepareClaudeCloudExperience(home); err != nil {
+		if err := prepareClaudeCloudExperience(home, policy); err != nil {
 			return err
 		}
 	}
@@ -1255,7 +1331,7 @@ func clearEnvironmentSecret(environment map[string]string, name string) {
 	delete(environment, name)
 }
 
-func prepareClaudeCloudExperience(home string) error {
+func prepareClaudeCloudExperience(home string, policy sandboxLaunchPolicy) error {
 	configDir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR"))
 	rootPaths := []string{filepath.Join(home, ".claude.json")}
 	if configDir != "" {
@@ -1282,7 +1358,17 @@ func prepareClaudeCloudExperience(home string) error {
 			permissions = map[string]any{}
 			settings["permissions"] = permissions
 		}
-		permissions["defaultMode"] = "bypassPermissions"
+		// Enforce the session's capability mode + denied commands via Claude's
+		// settings so the allow/deny rules are honored (they are ignored under
+		// bypassPermissions). deriveSandboxLaunchPolicy steps trusted-with-denials
+		// off bypass for us.
+		permissions["defaultMode"] = policy.settingsMode
+		if len(policy.allowedTools) > 0 {
+			permissions["allow"] = policy.allowedTools
+		}
+		if len(policy.deniedTools) > 0 {
+			permissions["deny"] = policy.deniedTools
+		}
 	}); err != nil {
 		return fmt.Errorf("prepare Claude settings: %w", err)
 	}

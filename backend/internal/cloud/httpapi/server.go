@@ -1458,6 +1458,9 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		Branch               string                      `json:"branch"`
 		Prompt               string                      `json:"prompt"`
 		Resource             clouddomain.ResourceProfile `json:"resource"`
+		Mode                 string                      `json:"mode"`
+		DeniedCommands       []string                    `json:"deniedCommands"`
+		MaxRuntimeMinutes    int                         `json:"maxRuntimeMinutes"`
 		ProviderConnectionID string                      `json:"providerConnectionId"`
 	}
 	if !decodeJSON(w, r, &input) {
@@ -1465,6 +1468,20 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.Kind == "" {
 		input.Kind = "worker"
+	}
+	// Per-sandbox security policy. Empty mode defaults to trusted (unchanged
+	// behavior); reject any other unknown value so a typo can't silently
+	// downgrade enforcement.
+	if input.Mode == "" {
+		input.Mode = clouddomain.SandboxModeTrusted
+	}
+	if clouddomain.NormalizeSandboxMode(input.Mode) != input.Mode {
+		writeError(w, r, http.StatusBadRequest, "INVALID_SANDBOX_MODE", "mode must be read-only, standard, or trusted.")
+		return
+	}
+	if input.MaxRuntimeMinutes < 0 {
+		writeError(w, r, http.StatusBadRequest, "INVALID_MAX_RUNTIME", "maxRuntimeMinutes must be zero or positive.")
+		return
 	}
 	if input.Kind != "worker" && input.Kind != "orchestrator" {
 		writeError(w, r, http.StatusBadRequest, "INVALID_SESSION_KIND", "kind must be worker or orchestrator.")
@@ -1530,6 +1547,9 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		Branch:                   strings.TrimSpace(input.Branch),
 		Prompt:                   input.Prompt,
 		Resource:                 input.Resource,
+		Mode:                     input.Mode,
+		DeniedCommands:           input.DeniedCommands,
+		AutoStopMinutes:          input.MaxRuntimeMinutes,
 		Provider:                 s.sandboxProvider,
 		ProviderConnectionID:     providerConnectionID(s.sandboxProvider, input.ProviderConnectionID),
 		MaxActiveSandboxesPerOrg: s.maxActiveSandboxesPerOrg,

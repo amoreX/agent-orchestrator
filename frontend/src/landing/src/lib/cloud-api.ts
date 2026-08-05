@@ -650,6 +650,11 @@ export class CloudAPI {
       displayName: string;
       prompt: string;
       providerConnectionId?: string;
+      // Per-sandbox security policy. Omitted fields fall back to the control
+      // plane defaults (trusted, no denied commands, 30-minute auto-stop).
+      mode?: "read-only" | "standard" | "trusted";
+      deniedCommands?: string[];
+      maxRuntimeMinutes?: number;
     },
     idempotencyKey: string,
   ) {
